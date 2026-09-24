@@ -1,0 +1,49 @@
+# Secrets / runtime config — НЕ коммитить.
+.env
+
+# Логи.
+*.log
+
+# Persistent agent memory and local runtime state.
+ai_memory.json
+
+# Локальное состояние рантайма (пересоздаётся при старте).
+watched_chats.json
+user_sessions.json
+photo_settings.json
+auto_tr_chats.json
+user_timezones.json
+nya_chats.json
+*.bak
+*.tmp
+
+# Локальная полнотекстовая база `.ии база`.
+knowledge.sqlite3
+knowledge.sqlite3-shm
+knowledge.sqlite3-wal
+knowledge_settings.json
+
+# Telethon-сессии (каждый .session — это авторизация).
+sessions/
+*.session
+*.session-journal
+
+# Временные скачанные медиа.
+temp/
+
+# Сторонний рантайм tooling (ключи, профили) — не часть проекта.
+qwengate-runtime/
+.claude/
+
+# Кэш Python.
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE.
+.idea/
+.vscode/
+
+# OS.
+.DS_Store
+Thumbs.db
