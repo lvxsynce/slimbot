@@ -795,6 +795,7 @@ def render_quote_png(
         _draw_runs(draw, img, lx, ly + (_info_lh - INFO_FONT_SIZE) // 2,
                    line, info_font, INFO_FONT_SIZE, INFO_COLOR,
                    inline=inline_images)
+        ly += _info_lh
 
     # --- Правый бокс: фон на всю правую часть + фото + текст ---
     if right_h > 0:
