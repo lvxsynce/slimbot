@@ -439,7 +439,7 @@ def test_two_column_photo_right_text_quoted():
     assert left_px != right_px  # разные зоны: инфо слева, контент справа
 
 
-def test_body_wrapped_in_quotes():
+def test_body_without_quote_marks():
     import utils.quote_image as qi
     seen = []
     orig = qi._draw_runs
@@ -451,8 +451,8 @@ def test_body_wrapped_in_quotes():
         render_quote_png(body="hello", sender_name="N", sender_id=1)
     finally:
         qi._draw_runs = orig
-    assert seen and seen[0].startswith("«") is False  # имя без кавычек
-    assert any("«" in s and "»" in s for s in seen)  # тело в кавычках
+    assert seen
+    assert not any("«" in s or "»" in s for s in seen)  # кавычек нет
 
 
 def test_info_strip_renders():

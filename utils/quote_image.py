@@ -612,7 +612,7 @@ def render_quote_png(
         │ @user · t │ └─────────────────┘ │
         └─────────────────────────────────┘
       Слева вверху — вся информация (аватар, имя, ID, username, дата).
-      Справа — вложение (фото fit-вписанное) и/или текст в «кавычках».
+      Справа — вложение (фото fit-вписанное) и/или текст.
     """
     if not is_available():
         return None
@@ -692,13 +692,13 @@ def render_quote_png(
     right_x = PADDING_X + LEFT_COL_W + COLUMN_GAP
     right_w = WIDTH - PADDING_X - right_x
     right_text_w = right_w - 2 * BUBBLE_TEXT_PAD_X
-    quoted = f"«{body_text}»" if body_text else ""
+    quoted = body_text
     body_lines = _wrap_text(quoted, body_font, max_width=right_text_w,
                             emoji_px=BODY_FONT_SIZE)
     if len(body_lines) > MAX_BODY_LINES:
         body_lines = body_lines[:MAX_BODY_LINES]
         if body_lines:
-            body_lines[-1] = body_lines[-1].rstrip() + "…»"
+            body_lines[-1] = body_lines[-1].rstrip() + "…"
     photo_img = None
     if background_bytes:
         try:
@@ -744,17 +744,12 @@ def render_quote_png(
                    line, info_font, INFO_FONT_SIZE, INFO_COLOR)
         ly += _info_lh
 
-    # --- Правый бокс: bubble + accent-bar + фото + текст ---
+    # --- Правый бокс: фон на всю правую часть + фото + текст ---
     if right_h > 0:
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
-        bubble_box = (right_x, _pad_y, WIDTH - PADDING_X, _pad_y + right_h)
+        bubble_box = (right_x, _pad_y, WIDTH - PADDING_X, total_height - _pad_y)
         overlay_draw.rounded_rectangle(bubble_box, radius=16, fill=BUBBLE_COLOR)
-        # Accent-полоса слева — маркер цитаты.
-        overlay_draw.rectangle(
-            (right_x, _pad_y + 10, right_x + 6, _pad_y + right_h - 10),
-            fill=NAME_COLOR,
-        )
         img.paste(overlay, (0, 0), mask=overlay)
         draw = ImageDraw.Draw(img)
         cy = _pad_y + _bub_pad_y
@@ -841,13 +836,13 @@ def render_info_strip_png(
             _wrap_text(item, info_font, max_width=text_w,
                        emoji_px=INFO_FONT_SIZE) or [item]
         )
-    quoted = f"«{body_text}»" if body_text else ""
+    quoted = body_text
     body_lines = _wrap_text(quoted, body_font, max_width=text_w,
                             emoji_px=BODY_FONT_SIZE)
     if len(body_lines) > MAX_BODY_LINES:
         body_lines = body_lines[:MAX_BODY_LINES]
         if body_lines:
-            body_lines[-1] = body_lines[-1].rstrip() + "…»"
+            body_lines[-1] = body_lines[-1].rstrip() + "…"
 
     h = pad
     if avatar_img is not None:
@@ -912,8 +907,12 @@ def _as_gif_direct(data: bytes) -> bytes | None:
         return None
 
 
-def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 30) -> bytes | None:
-    """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами."""
+def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40) -> bytes | None:
+    """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами.
+
+    Качество: кадры квантуются в адаптивную 256-палитру с дизерингом —
+    без этого Pillow режет цвета и гифка выглядит «грязной».
+    """
     from PIL import Image, ImageSequence
 
     gif = Image.open(io.BytesIO(gif_bytes))
@@ -930,7 +929,7 @@ def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int 
         canvas = Image.new("RGB", (strip_w + w, h), color=(0, 0, 0))
         canvas.paste(strip_small, (0, 0))
         canvas.paste(fr, (strip_w, 0))
-        frames.append(canvas)
+        frames.append(canvas.quantize(colors=256, method=Image.MEDIANCUT))
         durations.append(int(frame.info.get("duration", 100)) or 100)
     if len(frames) < 2:
         return None
@@ -983,10 +982,10 @@ async def render_video_quote_gif(
     video_bytes: bytes,
     *,
     card_png_bytes: bytes,
-    max_width: int = 640,
-    max_frames: int = 30,
-    fps: int = 10,
-    duration_s: float = 3.0,
+    max_width: int = 800,
+    max_frames: int = 40,
+    fps: int = 12,
+    duration_s: float = 4.0,
     timeout_s: float = 60.0,
 ) -> bytes | None:
     """Видео/гифка из реплая справа + info-плашка слева → анимированная GIF.
