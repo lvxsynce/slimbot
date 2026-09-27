@@ -1739,13 +1739,7 @@ class TelethonManager:
             topic_line = f"Топик: <b>{_esc(topic_name)}</b>\n" if topic_name else f"Топик: <code>{tid}</code>\n"
         is_video = path.endswith((".mp4", ".mov", ".webm"))
         label = "видео" if is_video else "фото"
-        caption = (
-            f"<b>Одноразовое {label} сохранено</b>\n"
-            f"Чат: <b>{chat_title}</b>\n"
-            f"{topic_line}"
-            f"<code>chat_id: {event.chat_id}</code>\n"
-            f"<code>thread_id: {tid}</code>"
-        )
+        caption = _view_once_caption(label, chat_title, topic_line, event.chat_id, tid)
         try:
             file = FSInputFile(path)
             if is_video:
@@ -1765,6 +1759,22 @@ class TelethonManager:
                 os.remove(path)
             except OSError:
                 pass
+
+
+def _view_once_caption(label: str, chat_title: str, topic_line: str, chat_id: int, thread_id: int) -> str:
+    """Единый формат уведомления о сохранённом одноразовом медиа.
+
+    Pure builder (без I/O) — покрыт тестами. Отправляется caption'ом
+    к фото/видео от бота в личку.
+    """
+    body = (
+        f"📸 Одноразовое {label} сохранено\n"
+        f"Чат: <b>{chat_title}</b>\n"
+        f"{topic_line}"
+        f"<code>chat_id: {chat_id}</code>\n"
+        f"<code>thread_id: {thread_id}</code>"
+    )
+    return _command_card("View-once", body)
 
 
 telethon_manager = TelethonManager()

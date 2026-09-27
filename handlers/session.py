@@ -85,6 +85,15 @@ WHY_TEXT = (
     "Нажми кнопку — всё настроится само."
 )
 
+WHY_ACTIVE = (
+    "<b>[?] Дополнительные возможности</b>\n\n"
+    "✅ Уже <b>включено</b>:\n"
+    "[+] Команды работают в любых чатах\n"
+    "[+] Одноразовые фото сохраняются\n"
+    "[+] Работает <code>.watch @username</code>\n\n"
+    "Выключить можно кнопкой ниже или командой /logout."
+)
+
 
 def _p_kbd(s: str = "") -> InlineKeyboardMarkup:
     btns = []
@@ -122,13 +131,24 @@ def _d_kbd(s: str = "") -> InlineKeyboardMarkup:
 
 @router.callback_query(lambda c: c.data == "w1")
 async def why_cb(callback: types.CallbackQuery):
-    await callback.message.edit_text(
-        WHY_TEXT,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="[+] Включить", callback_data="c1")],
-            [InlineKeyboardButton(text="[<-] Назад", callback_data="b1")],
-        ]),
-    )
+    from utils.storage import session_exists
+    uid = str(callback.from_user.id) if callback.from_user else ""
+    if uid and session_exists(uid):
+        await callback.message.edit_text(
+            WHY_ACTIVE,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="[x] Выключить", callback_data="logout_ask")],
+                [InlineKeyboardButton(text="[<-] Назад", callback_data="b1")],
+            ]),
+        )
+    else:
+        await callback.message.edit_text(
+            WHY_TEXT,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="[+] Включить", callback_data="c1")],
+                [InlineKeyboardButton(text="[<-] Назад", callback_data="b1")],
+            ]),
+        )
     await callback.answer()
 
 
