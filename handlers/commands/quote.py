@@ -16,7 +16,9 @@ import asyncio
 import html as _html
 import logging
 
-QUOTE_CMDS = (".quote", ".цитата")
+QUOTE_CMDS = (".quote", ".цитата", ".q", ".цит")
+
+QUOTE_VIDEO_MAX_BYTES = 20 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +41,98 @@ def _truncate(text: str, n: int = 2000) -> str:
     return text[:n] + "…"
 
 
+def _build_caption(first: str, last: str, fallback_name: str, sender_id, usernames: list, date_str: str) -> str:
+    """Caption под файл цитаты: имя + фамилия + ID + username + дата. Pure."""
+    name = ((first or "") + " " + (last or "")).strip() or (fallback_name or "?")
+    lines = [f"<b>{_esc(name)}</b>"]
+    if sender_id:
+        lines.append(f"ID: <code>{_esc(sender_id)}</code>")
+    if usernames:
+        lines.append("Username: " + " ".join(f"@{_esc(u)}" for u in usernames))
+    if date_str and date_str != "—":
+        lines.append(_esc(date_str))
+    return "\n".join(lines)
+
+
+_ANIMATED_STICKER_MIMES = {"application/x-tgsticker", "application/x-tgs-sticker"}
+
+
+def _reply_media_kind(reply) -> str | None:
+    """Классификация media реплая для .q: 'video' | 'photo' | None.
+
+    - video: video / video_note / animation (GIF) / документ с video-mime.
+    - photo: photo / документ с image-mime (включая статичные стикеры — нет,
+      стикеры отклоняем: это не фото).
+    Анимированные стикеры (TGS) и всё остальное → None.
+    """
+    if reply is None:
+        return None
+    doc = getattr(reply, "document", None)
+    mime = (getattr(doc, "mime_type", "") or "") if doc else ""
+    if mime in _ANIMATED_STICKER_MIMES:
+        return None
+    if getattr(reply, "sticker", None):
+        return None
+    if (
+        getattr(reply, "video", None)
+        or getattr(reply, "video_note", None)
+        or getattr(reply, "animation", None)
+        or getattr(reply, "gif", None)
+        or mime.startswith("video/")
+    ):
+        return "video"
+    if getattr(reply, "photo", None) or mime.startswith("image/"):
+        return "photo"
+    return None
+
+
+def _voice_duration(reply) -> int | None:
+    """Длительность голосового из атрибутов документа. Pure-ish, без сети."""
+    voice = getattr(reply, "voice", None)
+    if not voice:
+        return None
+    for attr in getattr(voice, "attributes", None) or []:
+        duration = getattr(attr, "duration", None)
+        if isinstance(duration, (int, float)) and duration > 0:
+            return int(duration)
+    return None
+
+
+def _voice_body(reply) -> str | None:
+    """Текст-заглушка для цитаты голосового. None если это не войс."""
+    if not getattr(reply, "voice", None):
+        return None
+    duration = _voice_duration(reply)
+    if duration:
+        minutes, seconds = divmod(duration, 60)
+        length = f"{minutes}:{seconds:02d}" if minutes else f"{seconds} сек"
+        return f"🎤 Голосовое сообщение ({length})"
+    return "🎤 Голосовое сообщение"
+
+
+async def _render_card_png(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str, background_bytes=None):
+    """PNG-карточка в executor'е (CPU-heavy Pillow). None если недоступно."""
+    try:
+        from utils.quote_image import render_quote_png, is_available as pillow_ok
+        if not pillow_ok():
+            return None
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: render_quote_png(
+                body=body_text,
+                sender_name=sender_name,
+                sender_id=sender_id,
+                usernames=usernames_list,
+                avatar_bytes=avatar_bytes,
+                timestamp=date_str,
+                background_bytes=background_bytes,
+            ),
+        )
+    except Exception as e:
+        logger.debug(f"quote: card render failed: {e}")
+        return None
+
+
 async def handle(user_id: str, event) -> None:
     """Telethon-вызов из telethon_manager._handle_outgoing."""
     reply = await event.get_reply_message()
@@ -52,12 +146,15 @@ async def handle(user_id: str, event) -> None:
 
     sender = await reply.get_sender()
     sender_name = "?"
+    sender_first = ""
+    sender_last = ""
     sender_id = None
     if sender is not None:
         try:
             uname = getattr(sender, "username", None)
             first = getattr(sender, "first_name", "") or ""
             last = getattr(sender, "last_name", "") or ""
+            sender_first, sender_last = first, last
             sender_name = (first + " " + last).strip() or uname or str(getattr(sender, "id", "?"))
             sender_id = getattr(sender, "id", None)
         except Exception:
@@ -82,10 +179,16 @@ async def handle(user_id: str, event) -> None:
         except Exception:
             pass
 
-    # Body — text or caption
+    # Body — text or caption; голосовое без текста — заглушка с длительностью
     body = (getattr(reply, "raw_text", "") or getattr(reply, "message", "") or "").strip()
     if not body:
         body = (getattr(reply, "caption", "") or "").strip()
+    voice_attach = False
+    if not body:
+        voice_body = _voice_body(reply)
+        if voice_body:
+            body = voice_body
+            voice_attach = True
     if not body:
         await event.edit(
             "<b>Slim bot | Quote</b>\n<blockquote>[?] Сообщение без текста (медиа-only). "
@@ -152,37 +255,106 @@ async def handle(user_id: str, event) -> None:
     ]
     fallback_html = command_card("Quote", "\n".join(fallback_lines))
 
+    # ---- Caption: имя + фамилия + ID + username + дата (требование .q) ----
+    caption = _build_caption(sender_first, sender_last, sender_name, sender_id, usernames_list, date_str)
+
+    # ---- Классификация media реплая: фон (фото) / GIF-путь (видео, incl. кружки) / войс ----
+    background_bytes: bytes | None = None
+    video_bytes: bytes | None = None
+    voice_bytes: bytes | None = None
+    try:
+        media_kind = _reply_media_kind(reply)
+        if media_kind == "video":
+            size = None
+            for holder in (getattr(reply, "document", None), getattr(reply, "video", None),
+                           getattr(reply, "video_note", None), getattr(reply, "animation", None)):
+                size = getattr(holder, "size", None)
+                if size:
+                    break
+            if not size or size <= QUOTE_VIDEO_MAX_BYTES:
+                video_bytes = await reply.download_media(file=bytes)
+        elif media_kind == "photo":
+            background_bytes = await reply.download_media(file=bytes)
+        if voice_attach:
+            vsize = getattr(getattr(reply, "voice", None), "size", None)
+            if not vsize or vsize <= QUOTE_VIDEO_MAX_BYTES:
+                voice_bytes = await reply.download_media(file=bytes)
+    except Exception as e:
+        logger.debug(f"quote: reply media download failed: {e}")
+
+    # ---- Попытка 0: GIF-цитата (видео/анимация/GIF в реплае) ----
+    if video_bytes:
+        png_card = await _render_card_png(
+            body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str
+        )
+        if png_card:
+            try:
+                from utils.quote_image import render_video_quote_gif
+                gif_bytes = await render_video_quote_gif(video_bytes, card_png_bytes=png_card)
+            except Exception as e:
+                logger.debug(f"quote: video GIF render failed: {e}")
+                gif_bytes = None
+            if gif_bytes:
+                try:
+                    from telethon.tl.types import DocumentAttributeAnimated
+                    from utils.telethon_manager import telethon_reply_to
+                    import io
+                    buf = io.BytesIO(gif_bytes)
+                    buf.name = "quote.gif"
+                    await event.client.send_file(
+                        event.chat_id,
+                        file=buf,
+                        caption=caption,
+                        reply_to=telethon_reply_to(event),
+                        force_document=False,
+                        attributes=[DocumentAttributeAnimated()],
+                        mime_type="image/gif",
+                    )
+                    try:
+                        await event.delete()
+                    except Exception as e:
+                        logger.debug(f"quote: delete origin failed: {e}")
+                    return
+                except Exception as e:
+                    logger.warning(f"quote: GIF send failed, falling back to PNG: {e}")
+
     # ---- Попытка 1: PNG render + send_file ----
     sent = False
-    try:
-        from utils.quote_image import render_quote_png, is_available as pillow_ok
-        if pillow_ok():
-            # Синхронный CPU-heavy PNG-рендер (Pillow) — в executor, чтобы
-            # не блокировать event loop на время отрисовки.
-            png_bytes = await asyncio.get_running_loop().run_in_executor(
-                None,
-                render_quote_png,
-                body_text,
-                sender_name,
-                sender_id,
-                usernames_list,
-                avatar_bytes,
-                date_str,
+    png_bytes = await _render_card_png(
+        body_text, sender_name, sender_id, usernames_list,
+        avatar_bytes, date_str, background_bytes,
+    )
+    if png_bytes:
+        try:
+            from utils.telethon_manager import telethon_reply_to
+            import io
+            buf = io.BytesIO(png_bytes)
+            buf.name = "quote.png"
+            quote_msg = await event.client.send_file(
+                event.chat_id,
+                file=buf,
+                caption=caption,
+                reply_to=telethon_reply_to(event),
+                force_document=False,
             )
-            if png_bytes:
-                from utils.telethon_manager import telethon_reply_to
-                import io
-                buf = io.BytesIO(png_bytes)
-                buf.name = "quote.png"
-                await event.client.send_file(
-                    event.chat_id,
-                    file=buf,
-                    reply_to=telethon_reply_to(event),
-                    force_document=False,
-                )
-                sent = True
-    except Exception as e:
-        logger.warning(f"quote: PNG render/send failed, falling back to HTML: {e}")
+            sent = True
+            # Цитата с голосовым: прикладываем оригинальный войс ответом на цитату.
+            if voice_bytes:
+                try:
+                    import io as _io
+                    vbuf = _io.BytesIO(voice_bytes)
+                    vbuf.name = "voice.ogg"
+                    quote_id = getattr(quote_msg, "id", None)
+                    await event.client.send_file(
+                        event.chat_id,
+                        file=vbuf,
+                        reply_to=quote_id,
+                        voice_note=True,
+                    )
+                except Exception as e:
+                    logger.debug(f"quote: voice attach failed: {e}")
+        except Exception as e:
+            logger.warning(f"quote: PNG send failed, falling back to HTML: {e}")
 
     # ---- Order-fix: delete только при sent=True ----
     if sent:

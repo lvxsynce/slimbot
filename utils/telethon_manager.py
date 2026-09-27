@@ -1073,7 +1073,7 @@ class TelethonManager:
         elif head in (".ссылка", ".invitelink", ".инвайт", ".invite"):
             from handlers.commands.invitelink import handle as handle_invite
             await handle_invite(user_id, event)
-        elif head in (".quote", ".цитата"):
+        elif head in (".quote", ".цитата", ".q", ".цит"):
             from handlers.commands.quote import handle as handle_quote
             await handle_quote(user_id, event)
         elif head in (".ня",):
