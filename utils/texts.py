@@ -863,33 +863,6 @@ class Texts:
             comment=".help — заголовок.",
         )
 
-        TIP = Text(
-            template=(
-                "<i>Подсказка:</i> <code>.команда справка</code> — "
-                "детали по любой команде."
-            ),
-            comment=".help — подсказка про `.cmd справка`.",
-        )
-
-        WITH_SESSION_HEADER = Text(
-            template="<b>С сессией ещё:</b>",
-            comment=".help — заголовок секции с сессией.",
-        )
-
-        NO_SESSION_HINT = Text(
-            template=(
-                "[i] Подключи <b>дополнительные возможности</b> (кнопка ниже) — "
-                "появятся <code>.del</code>, <code>.save</code>, "
-                "<code>.watch @user</code>, и команды будут работать везде."
-            ),
-            comment=".help — хинт без сессии.",
-        )
-
-        DISABLE_HINT = Text(
-            template="[i] Отключить сессию: <b>/logout</b>.",
-            comment=".help — хинт в самом конце.",
-        )
-
     # ----------------------------------------------------------------
     # /start
     # ----------------------------------------------------------------
@@ -908,15 +881,6 @@ class Texts:
                 "Отключить сессию: <b>/logout</b>."
             ),
             comment="/start (connected). values: bot_name, username, ss_status",
-        )
-
-        DISCONNECTED_GREETING = Text(
-            template=(
-                "Привет! Я <b>{bot_name}</b> (@{username}).\n\n"
-                "Нажми <b>[+] Включить</b> ниже, чтобы подключить Telethon-сессию.\n\n"
-                "После подключения команды будут работать в любых чатах."
-            ),
-            comment="/start (not connected). values: bot_name, username",
         )
 
         SS_ON = Text(

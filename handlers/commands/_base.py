@@ -156,122 +156,85 @@ async def dispatch(message, text: str, **kwargs):
         raise
 
 
+def _help_base_lines() -> list[str]:
+    """Базовые команды — работают всегда (в личке с ботом)."""
+    return [
+        "• <code>.ping</code> / <code>.пинг</code> — задержка",
+        "• <code>.time</code> / <code>.время</code> — время в твоей таймзоне",
+        "• <code>.id</code> / <code>.инфо</code> — ID чата",
+        "• <code>.me</code> / <code>.я</code> — мой профиль",
+        "• <code>.chat</code> / <code>.чат</code> — о чате",
+        "• <code>.who</code> / <code>.кто</code> — об отправителе (reply)",
+        "• <code>.net</code> — анализ IP, домена или URL",
+        "• <code>.hash</code> / <code>.хеш</code> — md5/sha1/sha256... (или файл по reply)",
+        "• <code>.uuid</code> / <code>.юид</code> — сгенерить UUID4 (до 20 штук)",
+        "• <code>.b64</code> / <code>.base64</code> — base64 encode/decode",
+        "• <code>.timezone</code> / <code>.tz</code> — твоя таймзона для <code>.time</code>",
+        "• <code>.tr</code> / <code>.перевод</code> — перевод",
+        "• <code>.calc</code> / <code>.калк</code> — калькулятор",
+        "• <code>.love</code> / <code>.любовь</code> — сердечко",
+        "• <code>.монетка</code> / <code>.coin</code> — орёл или решка",
+        "• <code>.ии</code> &lt;запрос&gt; — запрос к ИИ",
+        "• <code>.watch</code> / <code>.следить</code> — отслеживать чат",
+        "• <code>.unwatch</code> / <code>.хватит</code> — перестать",
+        "• <code>.watched</code> / <code>.список</code> — список",
+        "• <code>.help</code> / <code>.помощь</code> — это сообщение",
+    ]
+
+
+def _help_session_lines() -> list[str]:
+    """Команды Telethon-сессии — работают в любых чатах при активной сессии."""
+    return [
+        "• <code>.del [N]</code> / <code>.удалить</code> — снести N своих сообщений",
+        "• <code>.save</code> / <code>.сохранить</code> — в Избранное (reply)",
+        "• <code>.pin</code> / <code>.закрепить</code> — закрепить сообщение",
+        "• <code>.unpin</code> / <code>.открепить</code> — снять закрепление",
+        "• <code>.admins</code> / <code>.админы</code> — список админов чата",
+        "• <code>.tagall</code> / <code>.все</code> — тегнуть всех в группе",
+        "• <code>.влс</code> [текст] — в личку автору (reply)",
+        "• <code>.watch @username</code> — добавить по юзернейму",
+        "• <code>.watch -100123</code> — по ID",
+        "• <code>.ссылка</code> / <code>.invitelink</code> — инвайт-ссылка",
+        "• Команды работают в <b>любых чатах</b>",
+    ]
+
+
+def _help_lines(has_session: bool) -> list[str]:
+    """Единый текст справки: полный список всегда, состояние сессии
+    меняет только заголовок раздела и хинт внизу."""
+    lines = _help_base_lines()
+    lines += [
+        "",
+        "<b>Дополнительно:</b>" if has_session else "<b>Дополнительно (нужна сессия):</b>",
+        *_help_session_lines(),
+        "",
+        "<i>Подсказка:</i> <code>.команда справка</code> — детали по любой команде.",
+    ]
+    if has_session:
+        lines += [
+            "",
+            "[i] Отключить сессию: <b>/logout</b>.",
+        ]
+    else:
+        lines += [
+            "",
+            "[i] Подключи <b>дополнительные возможности</b> (кнопка ниже) — сессионные команды заработают в любых чатах.",
+        ]
+    return lines
+
+
 def format_help(has_session: bool = False) -> str:
     """``.help`` — скрытая справка по командам.
 
     Структура такая же, как раньше. Для premium используй :func:`render_help`.
     """
     title = Texts.Help.TITLE.render(premium=False)
-    base = [
-        "<blockquote expandable>",
-        title,
-        "",
-        "• <code>.ping</code> / <code>.пинг</code> — задержка",
-        "• <code>.time</code> / <code>.время</code> — время в твоей таймзоне",
-        "• <code>.id</code> / <code>.инфо</code> — ID чата",
-        "• <code>.me</code> / <code>.я</code> — мой профиль",
-        "• <code>.chat</code> / <code>.чат</code> — о чате",
-        "• <code>.who</code> / <code>.кто</code> — об отправителе (reply)",
-        "• <code>.net</code> — анализ IP, домена или URL",
-        "• <code>.hash</code> / <code>.хеш</code> — md5/sha1/sha256... (или файл по reply)",
-        "• <code>.uuid</code> / <code>.юид</code> — сгенерить UUID4 (до 20 штук)",
-        "• <code>.b64</code> / <code>.base64</code> — base64 encode/decode",
-        "• <code>.timezone</code> / <code>.tz</code> — твоя таймзона для <code>.time</code>",
-        "• <code>.tr</code> / <code>.перевод</code> — перевод",
-        "• <code>.calc</code> / <code>.калк</code> — калькулятор",
-        "• <code>.love</code> / <code>.любовь</code> — сердечко",
-        "• <code>.монетка</code> / <code>.coin</code> — орёл или решка",
-        "• <code>.ии</code> &lt;запрос&gt; — запрос к ИИ",
-        "• <code>.watch</code> / <code>.следить</code> — отслеживать чат",
-        "• <code>.unwatch</code> / <code>.хватит</code> — перестать",
-        "• <code>.watched</code> / <code>.список</code> — список",
-        "• <code>.help</code> / <code>.помощь</code> — это сообщение",
-        "",
-        "<i>Подсказка:</i> <code>.команда справка</code> — детали по любой команде.",
-    ]
-    if has_session:
-        base += [
-            "",
-            "<b>С сессией ещё:</b>",
-            "• <code>.del [N]</code> / <code>.удалить</code> — снести N своих сообщений",
-            "• <code>.save</code> / <code>.сохранить</code> — в Избранное (reply)",
-            "• <code>.pin</code> / <code>.закрепить</code> — закрепить сообщение",
-            "• <code>.unpin</code> / <code>.открепить</code> — снять закрепление",
-            "• <code>.admins</code> / <code>.админы</code> — список админов чата",
-            "• <code>.tagall</code> / <code>.все</code> — тегнуть всех в группе",
-            "• <code>.влс</code> [текст] — в личку автору (reply)",
-            "• <code>.watch @username</code> — добавить по юзернейму",
-            "• <code>.watch -100123</code> — по ID",
-            "• <code>.ссылка</code> / <code>.invitelink</code> — инвайт-ссылка",
-            "• Команды работают в <b>любых чатах</b>",
-        ]
-    else:
-        base += [
-            "",
-            "[i] Подключи <b>дополнительные возможности</b> (кнопка ниже) — появятся <code>.del</code>, <code>.save</code>, <code>.watch @user</code>, и команды будут работать везде.",
-        ]
-    base += [
-        "",
-        "[i] Отключить сессию: <b>/logout</b>.",
-        "</blockquote>",
-    ]
+    base = ["<blockquote expandable>", title, "", *_help_lines(has_session), "</blockquote>"]
     return command_card("Help", "\n".join(base))
 
 
 async def render_help(uid, has_session: bool = False) -> str:
     """``.help`` — финальный HTML со скрытым expandable-блоком."""
     title = await render_for_user(uid, Texts.Help.TITLE)
-    base = [
-        "<blockquote expandable>",
-        title,
-        "",
-        "• <code>.ping</code> / <code>.пинг</code> — задержка",
-        "• <code>.time</code> / <code>.время</code> — время в твоей таймзоне",
-        "• <code>.id</code> / <code>.инфо</code> — ID чата",
-        "• <code>.me</code> / <code>.я</code> — мой профиль",
-        "• <code>.chat</code> / <code>.чат</code> — о чате",
-        "• <code>.who</code> / <code>.кто</code> — об отправителе (reply)",
-        "• <code>.net</code> — анализ IP, домена или URL",
-        "• <code>.hash</code> / <code>.хеш</code> — md5/sha1/sha256... (или файл по reply)",
-        "• <code>.uuid</code> / <code>.юид</code> — сгенерить UUID4 (до 20 штук)",
-        "• <code>.b64</code> / <code>.base64</code> — base64 encode/decode",
-        "• <code>.timezone</code> / <code>.tz</code> — твоя таймзона для <code>.time</code>",
-        "• <code>.tr</code> / <code>.перевод</code> — перевод",
-        "• <code>.calc</code> / <code>.калк</code> — калькулятор",
-        "• <code>.love</code> / <code>.любовь</code> — сердечко",
-        "• <code>.монетка</code> / <code>.coin</code> — орёл или решка",
-        "• <code>.ии</code> &lt;запрос&gt; — запрос к ИИ",
-        "• <code>.watch</code> / <code>.следить</code> — отслеживать чат",
-        "• <code>.unwatch</code> / <code>.хватит</code> — перестать",
-        "• <code>.watched</code> / <code>.список</code> — список",
-        "• <code>.help</code> / <code>.помощь</code> — это сообщение",
-        "",
-        "<i>Подсказка:</i> <code>.команда справка</code> — детали по любой команде.",
-    ]
-    if has_session:
-        base += [
-            "",
-            "<b>С сессией ещё:</b>",
-            "• <code>.del [N]</code> / <code>.удалить</code> — снести N своих сообщений",
-            "• <code>.save</code> / <code>.сохранить</code> — в Избранное (reply)",
-            "• <code>.pin</code> / <code>.закрепить</code> — закрепить сообщение",
-            "• <code>.unpin</code> / <code>.открепить</code> — снять закрепление",
-            "• <code>.admins</code> / <code>.админы</code> — список админов чата",
-            "• <code>.tagall</code> / <code>.все</code> — тегнуть всех в группе",
-            "• <code>.влс</code> [текст] — в личку автору (reply)",
-            "• <code>.watch @username</code> — добавить по юзернейму",
-            "• <code>.watch -100123</code> — по ID",
-            "• <code>.ссылка</code> / <code>.invitelink</code> — инвайт-ссылка",
-            "• Команды работают в <b>любых чатах</b>",
-        ]
-    else:
-        base += [
-            "",
-            "[i] Подключи <b>дополнительные возможности</b> (кнопка ниже) — появятся <code>.del</code>, <code>.save</code>, <code>.watch @user</code>, и команды будут работать везде.",
-        ]
-    base += [
-        "",
-        "[i] Отключить сессию: <b>/logout</b>.",
-        "</blockquote>",
-    ]
+    base = ["<blockquote expandable>", title, "", *_help_lines(has_session), "</blockquote>"]
     return command_card("Help", "\n".join(base))
