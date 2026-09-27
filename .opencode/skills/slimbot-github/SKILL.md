@@ -11,19 +11,21 @@ description: GitHub-workflow проекта SlimBot (/root/slimbot → github.co
 - Версии: git-теги `vX.Y.Z` + GitHub Releases + `CHANGELOG.md` в корне
 - Коммиты от имени: `user.name=slimbot`, `user.email=slimbot@local` (через `git -c`, глобальный конфиг не настроен)
 
-## Авторизация (важно!)
-- На сервере НЕТ `gh`, НЕТ SSH-ключей GitHub, НЕТ сохранённых credentials (`git ls-remote origin` падает — это нормально)
-- Пуш/ API только по HTTPS + PAT пользователя (`ghp_...`, scope `repo`). Токен НЕ хранить в файлах скилла и репозитория!
-- Как брать токен: попросить пользователя вставить его сообщением в чат
-- Как использовать, не светя в истории: сохранить в `/root/.gh_tok` (`chmod 600`), использовать через credential helper, после операции стереть (`rm -f`):
-  ```
-  printf '%s' '<TOKEN>' > /root/.gh_tok && chmod 600 /root/.gh_tok
-  git -c credential.helper='!f() { echo username=x-access-token; echo "password=$(cat /root/.gh_tok)"; }; f' push origin <branch> --tags
-  rm -f /root/.gh_tok
-  ```
-- API: `curl -H "Authorization: Bearer $(cat /root/.gh_tok)" https://api.github.com/...`
+## Авторизация (важно! read carefully)
+- PAT scope `repo` СОХРАНЁН на сервере: `~/.git-credentials` (`chmod 600`, только root) + `git config --global credential.helper store`
+- Поэтому `git push/pull/fetch/ls-remote origin` работают БЕЗ ручного ввода токена. Отдельно токен у пользователя НЕ запрашивать, если store работает (проверка: `git ls-remote origin HEAD`)
+- Если store не срабатывает (смена токена/прав) — попросить новый PAT в чате и перезаписать `~/.git-credentials`, затем сразу проверить `git ls-remote`
+- API (релизы и др.): токен читать программно из `~/.git-credentials` внутри скрипта, НИКОГДА не подставлять через `echo`/подстановки в строке команды и не печатать
 - Создание релиза: `POST /repos/lvxsynce/slimbot/releases` с `{"tag_name","name","body"}`
 - Публичность: `PATCH /repos/lvxsynce/slimbot` с `{"private":false}`
+
+### Правила безопасности токена (строго!)
+1. НИКОГДА не выводить токен в чат, логи, коммиты, код или вывод команд (`grep`, `cat ~/.git-credentials` — ЗАПРЕЩЕНЫ; `remote -v` — безопасен, токена там нет)
+2. НИКОГДА не встраивать токен в remote URL (`git remote set-url` только чистый `https://github.com/...`)
+3. НИКОГДА не коммитить файлы с токеном; перед каждым коммитом проверять `git status` / staged-скан
+4. Токен — только для `origin` (github.com/lvxsynce/slimbot) и GitHub API этого репозитория; не использовать для других хостов/репо
+5. Временные файлы с токеном (если понадобятся для curl): только `/root/`, `chmod 600`, удалять сразу после (`rm -f`)
+6. При любом подозрении на утечку — сказать пользователю отозвать токен (Settings → Developer settings → Tokens) и выпустить новый
 
 ## Pre-push чеклист (обязательно каждый раз)
 1. Секреты: в `config.py` только пустые defaults; живые `TOKEN`/`API_ID`/`API_HASH` — только в локальном `.env`. Скан staged-файлов по маскам секретов перед коммитом
