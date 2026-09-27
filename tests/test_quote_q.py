@@ -278,7 +278,7 @@ def test_media_only_card_no_body():
     from PIL import Image
     im = Image.open(io.BytesIO(out))
     assert im.size[0] == 1400
-    assert im.size[1] < 400  # только header, без bubble
+    assert im.size[1] == 600  # VERTICAL_SCALE: min 240×2.5, только header без bubble
 
 
 def test_emoji_body_card():

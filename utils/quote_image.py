@@ -71,6 +71,11 @@ MAX_BODY_LINES = 30  # truncate after this many body lines (защита от ru
 MIN_HEIGHT = 240
 MAX_HEIGHT = 2400
 
+# Вертикальный масштаб карточки: все вертикальные метрики (отступы,
+# межстрочные интервалы, gaps) умножаются на это. Ширина и размер
+# шрифтов не меняются.
+VERTICAL_SCALE = 2.5
+
 # ===== Colors =====
 # Solid RGB background (canvas)
 BG_COLOR = (32, 33, 38)
@@ -641,22 +646,30 @@ def render_quote_png(
         if body_lines:
             body_lines[-1] = body_lines[-1].rstrip() + "…"
 
-    # --- Высота canvas ---
-    header_text_height = NAME_LINE_HEIGHT + INFO_LINE_HEIGHT + 6
+    # --- Высота canvas (вертикаль × VERTICAL_SCALE, текст центрируем в строках) ---
+    _pad_y = int(PADDING_Y * VERTICAL_SCALE)
+    _name_lh = int(NAME_LINE_HEIGHT * VERTICAL_SCALE)
+    _info_lh = int(INFO_LINE_HEIGHT * VERTICAL_SCALE)
+    _body_lh = int(BODY_LINE_HEIGHT * VERTICAL_SCALE)
+    _gap = int(HEADER_TO_BUBBLE_GAP * VERTICAL_SCALE)
+    _bub_pad_y = int(BUBBLE_TEXT_PAD_Y * VERTICAL_SCALE)
+    _min_h = int(MIN_HEIGHT * VERTICAL_SCALE)
+    _max_h = int(MAX_HEIGHT * VERTICAL_SCALE)
+    header_text_height = _name_lh + _info_lh + 6
     header_height = max(AVATAR_SIZE, header_text_height)
     if body_lines:
-        body_block_h = len(body_lines) * BODY_LINE_HEIGHT
-        bubble_height = body_block_h + 2 * BUBBLE_TEXT_PAD_Y
+        body_block_h = len(body_lines) * _body_lh
+        bubble_height = body_block_h + 2 * _bub_pad_y
         total_height = (
-            PADDING_Y + header_height
-            + HEADER_TO_BUBBLE_GAP
+            _pad_y + header_height
+            + _gap
             + bubble_height
-            + PADDING_Y
+            + _pad_y
         )
     else:
         # Медиа-цитата без текста: только header.
-        total_height = PADDING_Y + header_height + PADDING_Y
-    total_height = min(MAX_HEIGHT, max(MIN_HEIGHT, total_height))
+        total_height = _pad_y + header_height + _pad_y
+    total_height = min(_max_h, max(_min_h, total_height))
 
     # --- Canvas: RGB (universal preview) ---
     img = Image.new("RGB", (WIDTH, total_height), color=BG_COLOR)
@@ -668,7 +681,7 @@ def render_quote_png(
 
     # --- Header: avatar + name + info ---
     avatar_x = PADDING_X
-    avatar_y = PADDING_Y + (header_height - AVATAR_SIZE) // 2 if avatar_img else PADDING_Y
+    avatar_y = _pad_y + (header_height - AVATAR_SIZE) // 2 if avatar_img else _pad_y
     text_x = PADDING_X
     if avatar_img is not None:
         try:
@@ -677,18 +690,21 @@ def render_quote_png(
             img.paste(avatar_img.convert("RGB"), (avatar_x, avatar_y))
         text_x = avatar_x + AVATAR_SIZE + 20
 
-    name_y = PADDING_Y + (header_height - header_text_height) // 2
+    name_y = _pad_y + (header_height - header_text_height) // 2
     draw = ImageDraw.Draw(img)
-    _draw_runs(draw, img, text_x, name_y, sender_name_text, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
+    # Центрируем глифы внутри (вытянутых) строк — иначе текст липнет к верху.
+    _draw_runs(draw, img, text_x, name_y + (_name_lh - NAME_FONT_SIZE) // 2,
+               sender_name_text, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
     if info_str:
-        info_y = name_y + NAME_LINE_HEIGHT + 2
-        _draw_runs(draw, img, text_x, info_y, info_str, info_font, INFO_FONT_SIZE, INFO_COLOR)
+        info_y = name_y + _name_lh + 2
+        _draw_runs(draw, img, text_x, info_y + (_info_lh - INFO_FONT_SIZE) // 2,
+                   info_str, info_font, INFO_FONT_SIZE, INFO_COLOR)
 
     # --- Semi-transparent bubble overlay (RGBA) + body (только если есть текст) ---
     if body_lines:
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
-        bubble_y_top = PADDING_Y + header_height + HEADER_TO_BUBBLE_GAP
+        bubble_y_top = _pad_y + header_height + _gap
         bubble_box = (
             PADDING_X + BUBBLE_INSET_X,
             bubble_y_top,
@@ -703,11 +719,11 @@ def render_quote_png(
     # --- Body текст поверх bubble ---
     if body_lines:
         draw = ImageDraw.Draw(img)
-        text_y = bubble_y_top + BUBBLE_TEXT_PAD_Y
+        text_y = bubble_y_top + _bub_pad_y + (_body_lh - BODY_FONT_SIZE) // 2
         text_x = PADDING_X + BUBBLE_INSET_X + BUBBLE_TEXT_PAD_X
         for line in body_lines:
             _draw_runs(draw, img, text_x, text_y, line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
-            text_y += BODY_LINE_HEIGHT
+            text_y += _body_lh
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
