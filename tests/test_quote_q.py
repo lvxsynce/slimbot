@@ -718,3 +718,24 @@ def test_extended_emoji_ranges_kept():
     # стрелки/фигуры больше не пропадают и не крашат wrap
     out = render_quote_png(body="a → b ▶ c #️⃣", sender_name="N", sender_id=1)
     assert out is not None and len(out) > 1000
+
+
+def test_left_column_lines_do_not_overlap():
+    # Регрессия: строки инфо рисовались на одной Y (без ly +=) друг на друге.
+    from PIL import Image
+    out = render_quote_png(body="hi", sender_name="Имя Фамилия", sender_id=42,
+                           usernames=["u1", "u2"], timestamp="2026-01-01 10:00")
+    assert out is not None
+    im = Image.open(io.BytesIO(out)).convert("L")
+    px = im.load()
+    rows = [sum(1 for x in range(60, 520) if px[x, y] > 150) for y in range(im.height)]
+    blocks = []
+    inb = False
+    for y, v in enumerate(rows):
+        if v > 3 and not inb:
+            inb, start = True, y
+        elif v <= 3 and inb:
+            inb = False
+            blocks.append((start, y))
+    # имя + ID + 2 username + дата = 5 раздельных строк
+    assert len(blocks) >= 5, blocks
