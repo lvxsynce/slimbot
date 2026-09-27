@@ -39,30 +39,30 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-# ===== Layout constants =====
-WIDTH = 1200
-PADDING_X = 50
-PADDING_Y = 40
-AVATAR_SIZE = 80
+# ===== Layout constants (banner) =====
+WIDTH = 1400
+PADDING_X = 60
+PADDING_Y = 48
+AVATAR_SIZE = 110
 
 # Sizes шрифтов
-NAME_FONT_SIZE = 26
-INFO_FONT_SIZE = 22
-BODY_FONT_SIZE = 24
+NAME_FONT_SIZE = 34
+INFO_FONT_SIZE = 28
+BODY_FONT_SIZE = 32
 
 # Line heights
-NAME_LINE_HEIGHT = 36
-INFO_LINE_HEIGHT = 30
-BODY_LINE_HEIGHT = 38
+NAME_LINE_HEIGHT = 46
+INFO_LINE_HEIGHT = 38
+BODY_LINE_HEIGHT = 48
 
 # Gap между header-блоком и bubble
-HEADER_TO_BUBBLE_GAP = 18
+HEADER_TO_BUBBLE_GAP = 22
 
 # Bubble inset (внутри PADDING_X)
-BUBBLE_INSET_X = 24
+BUBBLE_INSET_X = 28
 # Padding text внутри bubble (сверху/снизу + left+right)
-BUBBLE_TEXT_PAD_X = 20
-BUBBLE_TEXT_PAD_Y = 22
+BUBBLE_TEXT_PAD_X = 24
+BUBBLE_TEXT_PAD_Y = 26
 
 # Body wrap limits
 MAX_BODY_LINES = 30  # truncate after this many body lines (защита от runaway)
@@ -99,6 +99,8 @@ _FALLBACK_FONT_PATH = Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
 
 
 # ===== Color emoji strip =====
+# Применяется ТОЛЬКО если нет emoji-шрифта (см. _emoji_base_font):
+# без него Pillow нечем рисовать цветные глифы и был бы tofu.
 _EMOJI_RE = re.compile(
     "["
     "\U0001F000-\U0001F02F"
@@ -125,6 +127,43 @@ _EMOJI_RE = re.compile(
     "]+",
     flags=re.UNICODE,
 )
+_EMOJI_FONT_PATH = Path("/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf")
+# Noto Color Emoji — CBDT-bitmap шрифт, рабочий strike только 109px.
+# Глифы рендерим в 109px и даунскейлим под целевой размер (кэш _emoji_glyph).
+_EMOJI_STRIKE_SIZE = 109
+# Zero-width / модификаторы: не рисуем отдельно (иначе tofu), advance 0.
+_EMOJI_SKIP = {"\u200d", "\ufe0f"}
+_EMOJI_RUN_RE = re.compile(
+    "["
+    "\U0001F000-\U0001F02F"
+    "\U0001F0A0-\U0001F0FF"
+    "\U0001F100-\U0001F1FF"
+    "\U0001F200-\U0001F2FF"
+    "\U0001F300-\U0001F5FF"
+    "\U0001F600-\U0001F64F"
+    "\U0001F650-\U0001F67F"
+    "\U0001F680-\U0001F6FF"
+    "\U0001F700-\U0001F77F"
+    "\U0001F780-\U0001F7FF"
+    "\U0001F800-\U0001F8FF"
+    "\U0001F900-\U0001F9FF"
+    "\U0001FA00-\U0001FAFF"
+    "\U0001FB00-\U0001FBFF"
+    "\U0001FC00-\U0001FCFF"
+    "\U0001FD00-\U0001FDFF"
+    "\U0001FE00-\U0001FEFF"
+    "\U0001FF00-\U0001FFEF"
+    "\u2600-\u26FF"
+    "\u2700-\u27BF"
+    "\u2300-\u23FF"
+    "\u20E3"
+    "\u200d"
+    "\ufe0f"
+    "]+",
+    flags=re.UNICODE,
+)
+_emoji_base = None
+_emoji_glyph_cache: dict = {}
 
 
 # ===== Pillow + font availability =====
@@ -215,31 +254,142 @@ def _resolve_font(size: int, text: str = ""):
 
 
 def _strip_html(text: str) -> str:
-    """Strip HTML + unescape + remove color emoji + collapse repeated spaces.
+    """Strip HTML + unescape + collapse repeated spaces.
 
-    Коллапсим ТОЛЬКО repeated spaces (через ``re.sub(r" {2,}", " ", ...)``),
-    НЕ \n — параграфы (\\n\\n) важны для multi-line сообщений в Telegram.
+    Color emoji вырезаются ТОЛЬКО если нет emoji-шрифта (иначе их рисует
+    _draw_runs). Коллапсим ТОЛЬКО repeated spaces (через
+    ``re.sub(r" {2,}", " ", ...)``), НЕ \n — параграфы (\\n\\n) важны
+    для multi-line сообщений в Telegram.
     """
     if not text:
         return ""
     text = re.sub(r"<[^>]+>", "", text)
     text = _html.unescape(text)
-    text = _EMOJI_RE.sub("", text)
+    if _emoji_base_font() is None:
+        text = _EMOJI_RE.sub("", text)
     text = re.sub(r" {2,}", " ", text)
     text = text.replace("\u00a0", " ").strip()
     return text
 
 
-def _wrap_text(text: str, font, max_width: int) -> list[str]:
+def _emoji_base_font():
+    """Noto Color Emoji в рабочем strike (109px). None если шрифта нет. Cached."""
+    global _emoji_base
+    if _emoji_base is None:
+        try:
+            from PIL import ImageFont
+            if _EMOJI_FONT_PATH.exists():
+                _emoji_base = ImageFont.truetype(str(_EMOJI_FONT_PATH), size=_EMOJI_STRIKE_SIZE)
+            else:
+                _emoji_base = False
+        except Exception:
+            _emoji_base = False
+    return _emoji_base or None
+
+
+def _segment_runs(text: str) -> list[tuple[str, str]]:
+    """Делит строку на runs: ('t', обычный текст) и ('e', emoji-последовательность)."""
+    runs: list[tuple[str, str]] = []
+    pos = 0
+    for m in _EMOJI_RUN_RE.finditer(text or ""):
+        if m.start() > pos:
+            runs.append(("t", text[pos:m.start()]))
+        runs.append(("e", m.group(0)))
+        pos = m.end()
+    if pos < len(text or ""):
+        runs.append(("t", (text or "")[pos:]))
+    return runs
+
+
+def _emoji_glyph(ch: str, px: int):
+    """Один цветной глиф высотой ~px (RGBA). None если глифа нет (не tofu'им).
+
+    Рендер в strike 109px + даунскейл. Без чернил (пустой bbox) → None.
+    Cached по (ch, px).
+    """
+    key = (ch, px)
+    if key in _emoji_glyph_cache:
+        return _emoji_glyph_cache[key]
+    out = None
+    try:
+        from PIL import Image, ImageDraw
+        base = _emoji_base_font()
+        if base is not None and ch not in _EMOJI_SKIP:
+            cell = Image.new("RGBA", (_EMOJI_STRIKE_SIZE, _EMOJI_STRIKE_SIZE), (0, 0, 0, 0))
+            d = ImageDraw.Draw(cell)
+            d.text((0, 0), ch, font=base, embedded_color=True)
+            bbox = cell.getbbox()
+            if bbox:
+                cell = cell.crop(bbox)
+                h = max(1, int(px))
+                w = max(1, int(cell.width * h / max(cell.height, 1)))
+                out = cell.resize((w, h))
+    except Exception:
+        out = None
+    _emoji_glyph_cache[key] = out
+    return out
+
+
+def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int) -> float:
+    """Ширина строки с учётом emoji-глифов (для wrap'а)."""
+    total = 0.0
+    for kind, chunk in runs:
+        if kind == "t":
+            try:
+                total += font.getlength(chunk)
+            except Exception:
+                total += len(chunk) * 8
+        else:
+            for ch in chunk:
+                g = _emoji_glyph(ch, emoji_px)
+                if g is not None:
+                    total += g.width
+    return total
+
+
+def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fill) -> float:
+    """Рисует строку runs (текст + цветные emoji). Возвращает x конца.
+
+    Baseline: глифы вписываются в высоту строки (emoji_px ≈ размер шрифта).
+    """
+    cx = x
+    for kind, chunk in _segment_runs(text):
+        if kind == "t":
+            if chunk:
+                draw.text((cx, y), chunk, fill=fill, font=font)
+                try:
+                    cx += font.getlength(chunk)
+                except Exception:
+                    cx += len(chunk) * 8
+        else:
+            for ch in chunk:
+                g = _emoji_glyph(ch, emoji_px)
+                if g is None:
+                    continue
+                try:
+                    top = int(y + max(0, (font.size if hasattr(font, "size") else emoji_px) - g.height))
+                    img.paste(g, (int(cx), top), mask=g)
+                except Exception:
+                    pass
+                cx += g.width
+    return cx
+
+
+def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None) -> list[str]:
     """Word-wrap text → list of strings длиной до max_width pixels.
 
     Слова длиннее max_width бьются посимвольно — иначе строка
-    уезжает за canvas.
+    уезжает за canvas. При emoji_px замер идёт через runs (текст +
+    цветные глифы), иначе классический font.getlength.
     """
     if not text:
         return []
 
+    use_runs = emoji_px is not None and _emoji_base_font() is not None
+
     def _measure(s: str) -> float:
+        if use_runs:
+            return _runs_width(_segment_runs(s), font, emoji_px)
         try:
             return font.getlength(s)
         except Exception:
@@ -303,25 +453,32 @@ def _circle_avatar(avatar_bytes: bytes):
 # ===== Main entry point v2 =====
 
 def _apply_background(img, bg_bytes: bytes):
-    """Фото из реплая как фон: cover-fit + blur + затемнение.
+    """Фото из реплая как фон: резкий fit-центр + блюр-подложка + затемнение.
 
-    Pure (Pillow only) — покрыта тестами. Возвращает новый RGB Image
-    того же размера. Бросает исключение при битых байтах (caller ловит).
+    Подстраивается под размер цитаты (canvas): фото целиком по центру без
+    кропа, пустые поля заливает блюр той же фотки. Pure (Pillow only).
+    Возвращает новый RGB Image того же размера. Бросает исключение
+    при битых байтах (caller ловит).
     """
     from PIL import Image, ImageFilter
 
     bg = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
     w, h = img.size
-    # cover-fit: масштабируем чтобы покрыть canvas, лишнее режем по центру
+    # Подложка: cover-fit + blur (заполняет весь canvas без дыр).
     scale = max(w / max(bg.width, 1), h / max(bg.height, 1))
-    bg = bg.resize((max(1, int(bg.width * scale)), max(1, int(bg.height * scale))))
-    left = (bg.width - w) // 2
-    top = (bg.height - h) // 2
-    bg = bg.crop((left, top, left + w, top + h))
-    bg = bg.filter(ImageFilter.GaussianBlur(radius=12))
-    # затемнение чтобы белый текст читался
+    cover = bg.resize((max(1, int(bg.width * scale)), max(1, int(bg.height * scale))))
+    left = (cover.width - w) // 2
+    top = (cover.height - h) // 2
+    backdrop = cover.crop((left, top, left + w, top + h))
+    backdrop = backdrop.filter(ImageFilter.GaussianBlur(radius=14))
+    # Центр: резкое фото целиком (contain-fit), без кропа.
+    fit_scale = min(w / max(bg.width, 1), h / max(bg.height, 1))
+    fw, fh = max(1, int(bg.width * fit_scale)), max(1, int(bg.height * fit_scale))
+    sharp = bg.resize((fw, fh))
+    backdrop.paste(sharp, ((w - fw) // 2, (h - fh) // 2))
+    # Затемнение чтобы белый текст читался.
     dark = Image.new("RGB", (w, h), color=(0, 0, 0))
-    return Image.blend(bg, dark, alpha=0.55)
+    return Image.blend(backdrop, dark, alpha=0.45)
 
 
 def render_quote_png(
@@ -366,8 +523,6 @@ def render_quote_png(
     from PIL import Image, ImageDraw
 
     body_text = _strip_html(body)
-    if not body_text:
-        return None
 
     sender_name_text = _strip_html(sender_name) or "(unknown)"
     unames = (usernames or [])[:2]
@@ -393,9 +548,9 @@ def render_quote_png(
     # --- Аватарка (опционально) ---
     avatar_img = _circle_avatar(avatar_bytes) if avatar_bytes else None
 
-    # --- Wrap body ---
+    # --- Wrap body (медиа-цитата без текста: bubble пропускаем) ---
     bubble_text_max_width = WIDTH - 2 * PADDING_X - 2 * BUBBLE_INSET_X - 2 * BUBBLE_TEXT_PAD_X
-    body_lines = _wrap_text(body_text, body_font, max_width=bubble_text_max_width)
+    body_lines = _wrap_text(body_text, body_font, max_width=bubble_text_max_width, emoji_px=BODY_FONT_SIZE)
     if len(body_lines) > MAX_BODY_LINES:
         body_lines = body_lines[:MAX_BODY_LINES]
         if body_lines:
@@ -404,15 +559,18 @@ def render_quote_png(
     # --- Высота canvas ---
     header_text_height = NAME_LINE_HEIGHT + INFO_LINE_HEIGHT + 6
     header_height = max(AVATAR_SIZE, header_text_height)
-    body_block_h = len(body_lines) * BODY_LINE_HEIGHT
-    bubble_height = body_block_h + 2 * BUBBLE_TEXT_PAD_Y
-
-    total_height = (
-        PADDING_Y + header_height
-        + HEADER_TO_BUBBLE_GAP
-        + bubble_height
-        + PADDING_Y
-    )
+    if body_lines:
+        body_block_h = len(body_lines) * BODY_LINE_HEIGHT
+        bubble_height = body_block_h + 2 * BUBBLE_TEXT_PAD_Y
+        total_height = (
+            PADDING_Y + header_height
+            + HEADER_TO_BUBBLE_GAP
+            + bubble_height
+            + PADDING_Y
+        )
+    else:
+        # Медиа-цитата без текста: только header.
+        total_height = PADDING_Y + header_height + PADDING_Y
     total_height = min(MAX_HEIGHT, max(MIN_HEIGHT, total_height))
 
     # --- Canvas: RGB (universal preview) ---
@@ -436,48 +594,35 @@ def render_quote_png(
 
     name_y = PADDING_Y + (header_height - header_text_height) // 2
     draw = ImageDraw.Draw(img)
-    draw.text(
-        (text_x, name_y),
-        sender_name_text,
-        fill=NAME_COLOR,
-        font=name_font,
-    )
+    _draw_runs(draw, img, text_x, name_y, sender_name_text, name_font, NAME_FONT_SIZE, NAME_COLOR)
     if info_str:
         info_y = name_y + NAME_LINE_HEIGHT + 2
-        draw.text(
-            (text_x, info_y),
-            info_str,
-            fill=INFO_COLOR,
-            font=info_font,
-        )
+        _draw_runs(draw, img, text_x, info_y, info_str, info_font, INFO_FONT_SIZE, INFO_COLOR)
 
-    # --- Semi-transparent bubble overlay (RGBA) ---
-    overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    overlay_draw = ImageDraw.Draw(overlay)
-    bubble_y_top = PADDING_Y + header_height + HEADER_TO_BUBBLE_GAP
-    bubble_box = (
-        PADDING_X + BUBBLE_INSET_X,
-        bubble_y_top,
-        WIDTH - PADDING_X - BUBBLE_INSET_X,
-        bubble_y_top + bubble_height,
-    )
-    overlay_draw.rounded_rectangle(
-        bubble_box, radius=16, fill=BUBBLE_COLOR,
-    )
-    img.paste(overlay, (0, 0), mask=overlay)
+    # --- Semi-transparent bubble overlay (RGBA) + body (только если есть текст) ---
+    if body_lines:
+        overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
+        overlay_draw = ImageDraw.Draw(overlay)
+        bubble_y_top = PADDING_Y + header_height + HEADER_TO_BUBBLE_GAP
+        bubble_box = (
+            PADDING_X + BUBBLE_INSET_X,
+            bubble_y_top,
+            WIDTH - PADDING_X - BUBBLE_INSET_X,
+            bubble_y_top + bubble_height,
+        )
+        overlay_draw.rounded_rectangle(
+            bubble_box, radius=16, fill=BUBBLE_COLOR,
+        )
+        img.paste(overlay, (0, 0), mask=overlay)
 
     # --- Body текст поверх bubble ---
-    draw = ImageDraw.Draw(img)
-    text_y = bubble_y_top + BUBBLE_TEXT_PAD_Y
-    text_x = PADDING_X + BUBBLE_INSET_X + BUBBLE_TEXT_PAD_X
-    for line in body_lines:
-        draw.text(
-            (text_x, text_y),
-            line,
-            fill=TEXT_COLOR,
-            font=body_font,
-        )
-        text_y += BODY_LINE_HEIGHT
+    if body_lines:
+        draw = ImageDraw.Draw(img)
+        text_y = bubble_y_top + BUBBLE_TEXT_PAD_Y
+        text_x = PADDING_X + BUBBLE_INSET_X + BUBBLE_TEXT_PAD_X
+        for line in body_lines:
+            _draw_runs(draw, img, text_x, text_y, line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
+            text_y += BODY_LINE_HEIGHT
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
