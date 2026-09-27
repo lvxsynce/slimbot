@@ -422,6 +422,14 @@ async def handle(user_id: str, event) -> None:
     if not raw_source:
         raw_source = (getattr(reply, "caption", "") or "")
     spans = _custom_emoji_spans(reply)
+    logger.warning(
+        "quote diag: raw_len=%d entities=%s spans=%s",
+        len(raw_source),
+        [(e.__class__.__name__, getattr(e, "offset", None),
+          getattr(e, "length", None), getattr(e, "document_id", None))
+         for e in (getattr(reply, "entities", None) or [])],
+        spans,
+    )
     emoji_data: dict = {}
     if spans:
         try:
