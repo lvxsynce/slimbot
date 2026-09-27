@@ -94,7 +94,7 @@ def test_render_with_background():
     )
     assert out is not None and len(out) > 5000
     from PIL import Image
-    assert Image.open(io.BytesIO(out)).size[0] == 1200
+    assert Image.open(io.BytesIO(out)).size[0] == 1400
 
 
 def _two_frame_gif():
@@ -249,3 +249,105 @@ def test_quote_with_voice_attaches_voice():
     assert voice_kw.get("voice_note") is True
     assert voice_kw.get("reply_to") == 777
     assert deleted == [True]
+
+
+def test_emoji_kept_and_rendered():
+    from utils.quote_image import (
+        _strip_html, _segment_runs, _emoji_glyph, _draw_runs,
+        _resolve_font, BODY_FONT_SIZE,
+    )
+    from PIL import Image, ImageDraw
+
+    assert "🎤" in _strip_html("hi 🎤 yo")
+    runs = _segment_runs("a🎤b")
+    assert ("t", "a") in runs and ("e", "🎤") in runs and ("t", "b") in runs
+    g = _emoji_glyph("🎤", 32)
+    assert g is not None and g.height > 0
+
+    font = _resolve_font(BODY_FONT_SIZE, "hi")
+    img = Image.new("RGB", (600, 80), color=(32, 33, 38))
+    d = ImageDraw.Draw(img)
+    end_x = _draw_runs(d, img, 10, 10, "hi 🎤", font, BODY_FONT_SIZE, (240, 240, 240))
+    assert end_x > 60  # текст + глиф заняли место
+    assert img.tobytes() != Image.new("RGB", (600, 80), color=(32, 33, 38)).tobytes()
+
+
+def test_media_only_card_no_body():
+    out = render_quote_png(body="", sender_name="Иван", sender_id=9,
+                           usernames=[], avatar_bytes=None, timestamp="t")
+    assert out is not None and len(out) > 1000
+    from PIL import Image
+    im = Image.open(io.BytesIO(out))
+    assert im.size[0] == 1400
+    assert im.size[1] < 400  # только header, без bubble
+
+
+def test_emoji_body_card():
+    out = render_quote_png(body="привет 🎤 как дела ❤️", sender_name="N",
+                           sender_id=1, background_bytes=_png_bytes((20, 120, 200)))
+    assert out is not None and len(out) > 5000
+
+
+def test_caption_capped():
+    from handlers.commands.quote import _build_caption
+    cap = _build_caption("A", "B", "AB", 1, [f"user{i}" for i in range(50)], "d")
+    assert len(cap) <= 1000
+    assert "…и ещё" in cap
+
+
+def test_sticker_reply_becomes_photo_quote():
+    from handlers.commands.quote import handle
+
+    sent_files = []
+
+    class Reply:
+        raw_text = None
+        message = None
+        caption = None
+        photo = None
+        video = None
+        video_note = None
+        animation = None
+        gif = None
+        document = None
+        sticker = True
+        voice = None
+        date = None
+        fwd_from = None
+
+        async def get_sender(self):
+            return SimpleNamespace(id=77, username=None, first_name="Анна",
+                                   last_name=None, deleted=False)
+
+        async def download_media(self, file=None):
+            raise RuntimeError("nothing to download")
+
+    class Client:
+        async def __call__(self, *args, **kwargs):
+            raise RuntimeError("no mtproto")
+
+        async def send_file(self, chat_id, file, **kwargs):
+            sent_files.append((file, kwargs))
+            return SimpleNamespace(id=555)
+
+    class Event:
+        chat_id = -100
+        id = 2
+        message = None
+        client = Client()
+        edits = []
+        deleted = []
+
+        async def get_reply_message(self):
+            return Reply()
+
+        async def edit(self, text, **kwargs):
+            self.edits.append(text)
+
+        async def delete(self):
+            self.deleted.append(True)
+
+    asyncio.run(handle("u-sticker", ev := Event()))
+    assert len(sent_files) == 1
+    assert not ev.edits or "Цитировать нечего" not in ev.edits[0]
+    assert ev.deleted == [True]

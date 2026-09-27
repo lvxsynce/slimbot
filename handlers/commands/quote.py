@@ -42,16 +42,26 @@ def _truncate(text: str, n: int = 2000) -> str:
 
 
 def _build_caption(first: str, last: str, fallback_name: str, sender_id, usernames: list, date_str: str) -> str:
-    """Caption под файл цитаты: имя + фамилия + ID + username + дата. Pure."""
+    """Caption под файл цитаты: имя + фамилия + ID + username + дата. Pure.
+
+    Telegram режет caption на 1024 символах (иначе BadRequest 'can't parse') —
+    кап с запасом: юзернеймов максимум 5, итог максимум 1000 символов.
+    """
     name = ((first or "") + " " + (last or "")).strip() or (fallback_name or "?")
     lines = [f"<b>{_esc(name)}</b>"]
     if sender_id:
         lines.append(f"ID: <code>{_esc(sender_id)}</code>")
     if usernames:
-        lines.append("Username: " + " ".join(f"@{_esc(u)}" for u in usernames))
+        shown = list(usernames)[:5]
+        lines.append("Username: " + " ".join(f"@{_esc(u)}" for u in shown))
+        if len(usernames) > 5:
+            lines.append(f"<i>…и ещё {len(usernames) - 5}</i>")
     if date_str and date_str != "—":
         lines.append(_esc(date_str))
-    return "\n".join(lines)
+    out = "\n".join(lines)
+    if len(out) > 1000:
+        out = out[:1000].rsplit("\n", 1)[0]
+    return out
 
 
 _ANIMATED_STICKER_MIMES = {"application/x-tgsticker", "application/x-tgs-sticker"}
@@ -189,13 +199,11 @@ async def handle(user_id: str, event) -> None:
         if voice_body:
             body = voice_body
             voice_attach = True
-    if not body:
-        await event.edit(
-            "<b>Slim bot | Quote</b>\n<blockquote>[?] Сообщение без текста (медиа-only). "
-            "Цитировать нечего.</blockquote>",
-            parse_mode="html",
-        )
-        return
+    if not body and not voice_attach:
+        # Без текста цитируем само сообщение: карточка-шапка без bubble
+        # всегда уходит фоткой (фото/видео из реплая — фоном/GIF-кой ниже).
+        # Ветки «цитировать нечего» больше нет: любой реплай → фото.
+        body = ""
 
     body_text = _truncate(body)
 
