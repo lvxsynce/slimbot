@@ -739,3 +739,87 @@ def test_left_column_lines_do_not_overlap():
             blocks.append((start, y))
     # имя + ID + 2 username + дата = 5 раздельных строк
     assert len(blocks) >= 5, blocks
+
+
+def test_placeholders_only_when_available():
+    from handlers.commands.quote import _apply_emoji_placeholders
+    spans = [(3, 2, 111), (8, 2, 222)]
+    text, mapping = _apply_emoji_placeholders("hi 🔥 yo 🎉!", spans, {111})
+    assert list(mapping.values()) == [111]
+    assert "🎉" in text  # не скачалось — исходный символ на месте
+    assert "🔥" not in text
+
+
+def test_fetch_custom_emoji_tgs_thumb():
+    import asyncio
+    from handlers.commands.quote import _fetch_custom_emoji
+
+    webp = _png_bytes((10, 200, 90), size=(100, 100))
+
+    class Client:
+        async def __call__(self, req):
+            assert req.__class__.__name__ == "GetCustomEmojiDocumentsRequest"
+            return [SimpleNamespace(id=777, mime_type="application/x-tgsticker")]
+
+        async def download_media(self, doc, file=None, thumb=None):
+            assert thumb == -1  # TGS качаем thumb с сервера, не вектор
+            return webp
+
+    res = asyncio.run(_fetch_custom_emoji(Client(), [777]))
+    assert 777 in res
+    assert len(res[777]["frames"]) == 1
+
+
+def test_fetch_custom_emoji_webm_frames():
+    import asyncio
+    import subprocess
+    from handlers.commands.quote import _fetch_custom_emoji
+    from utils.gif_converter import is_ffmpeg_available
+    if not is_ffmpeg_available():
+        import pytest
+        pytest.skip("no ffmpeg")
+    p = subprocess.run(
+        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+         "-f", "lavfi", "-i", "testsrc=duration=0.5:size=100x100:rate=10",
+         "-c:v", "libvpx-vp9", "-f", "webm", "pipe:1"],
+        capture_output=True, timeout=60)
+    assert p.stdout, "synth webm failed"
+
+    class Client:
+        async def __call__(self, req):
+            return [SimpleNamespace(id=888, mime_type="video/webm")]
+
+        async def download_media(self, doc, file=None, thumb=None):
+            assert thumb is None
+            return p.stdout
+
+    res = asyncio.run(_fetch_custom_emoji(Client(), [888]))
+    assert 888 in res
+    assert len(res[888]["frames"]) > 1  # анимация разобрана покадрово
+
+
+def test_select_anim_phases():
+    from handlers.commands.quote import _select_anim_phases
+    assert _select_anim_phases(0) == []
+    assert _select_anim_phases(1) == [0]
+    assert _select_anim_phases(4) == [0, 1, 2, 3]
+    ph = _select_anim_phases(36)
+    assert len(ph) == 8 and ph[0] == 0 and ph[-1] == 35
+
+
+def test_stack_anim_strips_change_over_time():
+    from utils.quote_image import (
+        render_info_strip_png, _stack_gif_side_by_side)
+    s1 = render_info_strip_png(sender_name="N", sender_id=1, body="phase one")
+    s2 = render_info_strip_png(sender_name="N", sender_id=1, body="phase two is longer here")
+    assert s1 != s2
+    out = _stack_gif_side_by_side(_two_frame_gif(), s1, max_frames=10,
+                                  anim_strips=[s1, s2], anim_duration_ms=300)
+    assert out is not None
+    from PIL import Image, ImageSequence
+    frames = [f.convert("RGB") for f in ImageSequence.Iterator(Image.open(io.BytesIO(out)))]
+    assert len(frames) == 2
+    # фазы разные → левые части кадров различаются
+    import hashlib
+    h = [hashlib.md5(f.crop((0, 0, 100, f.height)).tobytes()).hexdigest() for f in frames]
+    assert h[0] != h[1]

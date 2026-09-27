@@ -301,6 +301,69 @@ async def video_to_gif_bytes(
     return stdout
 
 
+async def webm_emoji_to_frames(
+    data: bytes,
+    *,
+    fps: int = 12,
+    size: int = 128,
+    max_frames: int = 40,
+    timeout_s: float = 30.0,
+) -> tuple[list, list[int]]:
+    """Animated custom emoji (webm/VP9+alpha) → ([RGBA frames], [durations ms]).
+
+    Ужимаем до мелкого GIF (fps×size) и разбираем Pillow — для встраивания
+    анимации эмодзи в GIF-цитаты. Пустой результат ([], []) если нечем/упало.
+    """
+    if not data or not is_ffmpeg_available():
+        return [], []
+    import asyncio as _asyncio
+    cmd = [
+        "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+        "-i", "pipe:0",
+        "-vf", f"fps={fps},scale={size}:-1:flags=lanczos",
+        "-f", "gif", "pipe:1",
+    ]
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=_asyncio.subprocess.PIPE,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await _asyncio.wait_for(proc.communicate(input=data), timeout=timeout_s)
+        except _asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return [], []
+        if proc.returncode != 0 or not stdout:
+            return [], []
+    except Exception:
+        return [], []
+
+    def _parse():
+        try:
+            from PIL import Image, ImageSequence
+            import io as _io
+            frames, durations = [], []
+            for i, fr in enumerate(ImageSequence.Iterator(Image.open(_io.BytesIO(stdout)))):
+                if i >= max_frames:
+                    break
+                frames.append(fr.convert("RGBA"))
+                durations.append(int(fr.info.get("duration", 100)) or 100)
+            return frames, durations
+        except Exception:
+            return [], []
+    try:
+        loop = _asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _parse)
+    except Exception:
+        return [], []
+
+
 async def image_audio_to_video_bytes(
     card_png: bytes,
     audio_bytes: bytes,
