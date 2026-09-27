@@ -71,9 +71,10 @@ MAX_BODY_LINES = 30  # truncate after this many body lines (защита от ru
 MIN_HEIGHT = 240
 MAX_HEIGHT = 2400
 
-# Вертикальный масштаб карточки: все вертикальные метрики (отступы,
-# межстрочные интервалы, gaps) умножаются на это. Ширина и размер
-# шрифтов не меняются.
+# Вертикальный масштаб карточки: применяется к отступам и гэпам (PADDING_Y,
+# HEADER_TO_BUBBLE_GAP, BUBBLE_TEXT_PAD_Y). Межстрочные интервалы НЕ
+# масштабируются — строки текста идут компактно, без «переносов» между ними.
+# Ширина и размер шрифтов не меняются.
 VERTICAL_SCALE = 2.5
 
 # Two-column layout: слева инфо-колонка, справа контент-бокс.
@@ -655,9 +656,9 @@ def render_quote_png(
 
     # --- Вертикальный масштаб ---
     _pad_y = int(PADDING_Y * VERTICAL_SCALE)
-    _name_lh = int(NAME_LINE_HEIGHT * VERTICAL_SCALE)
-    _info_lh = int(INFO_LINE_HEIGHT * VERTICAL_SCALE)
-    _body_lh = int(BODY_LINE_HEIGHT * VERTICAL_SCALE)
+    _name_lh = NAME_LINE_HEIGHT
+    _info_lh = INFO_LINE_HEIGHT
+    _body_lh = BODY_LINE_HEIGHT
     _gap = int(HEADER_TO_BUBBLE_GAP * VERTICAL_SCALE)
     _bub_pad_y = int(BUBBLE_TEXT_PAD_Y * VERTICAL_SCALE)
     _min_h = int(MIN_HEIGHT * VERTICAL_SCALE)
@@ -812,9 +813,9 @@ def render_info_strip_png(
     pad = 36
     text_w = width - 2 * pad
     gap = int(HEADER_TO_BUBBLE_GAP * VERTICAL_SCALE)
-    name_lh = int(NAME_LINE_HEIGHT * VERTICAL_SCALE)
-    info_lh = int(INFO_LINE_HEIGHT * VERTICAL_SCALE)
-    body_lh = int(BODY_LINE_HEIGHT * VERTICAL_SCALE)
+    name_lh = NAME_LINE_HEIGHT
+    info_lh = INFO_LINE_HEIGHT
+    body_lh = BODY_LINE_HEIGHT
 
     avatar_img = _circle_avatar(avatar_bytes) if avatar_bytes else None
 
@@ -907,32 +908,53 @@ def _as_gif_direct(data: bytes) -> bytes | None:
         return None
 
 
-def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40) -> bytes | None:
+def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40,
+                            max_width: int = 800) -> bytes | None:
     """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами.
 
-    Качество: кадры квантуются в адаптивную 256-палитру с дизерингом —
-    без этого Pillow режет цвета и гифка выглядит «грязной».
+    Качество:
+    - мелкие кадры апскейлятся (lanczos, до max_width и не более 2x) —
+      итог заметно больше исходной гифки;
+    - ОДНА общая 256-палитра на все кадры (MEDIANCUT по монтаж-тамбнейлам +
+      FLOYDSTEINBERG): без этого покадровые палитры дают грязь и мерцание.
     """
     from PIL import Image, ImageSequence
 
     gif = Image.open(io.BytesIO(gif_bytes))
     strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
-    frames: list = []
+    canvases: list = []
     durations: list[int] = []
     for i, frame in enumerate(ImageSequence.Iterator(gif)):
         if i >= max_frames:
             break
         fr = frame.convert("RGB")
         w, h = fr.size
+        if w < max_width:
+            s = min(max_width / max(w, 1), 2.0)
+            fr = fr.resize((max(1, int(w * s)), max(1, int(h * s))), Image.LANCZOS)
+            w, h = fr.size
         strip_w = max(1, int(strip.width * h / max(strip.height, 1)))
         strip_small = strip.resize((strip_w, h))
         canvas = Image.new("RGB", (strip_w + w, h), color=(0, 0, 0))
         canvas.paste(strip_small, (0, 0))
         canvas.paste(fr, (strip_w, 0))
-        frames.append(canvas.quantize(colors=256, method=Image.MEDIANCUT))
+        canvases.append(canvas)
         durations.append(int(frame.info.get("duration", 100)) or 100)
-    if len(frames) < 2:
+    if len(canvases) < 2:
         return None
+    # Общая палитра: монтаж ужатых копий → MEDIANCUT → один набор цветов.
+    thumbs = []
+    for c in canvases:
+        t = c.copy()
+        t.thumbnail((160, 160))
+        thumbs.append(t)
+    montage = Image.new("RGB", (sum(t.width for t in thumbs), max(t.height for t in thumbs)))
+    x = 0
+    for t in thumbs:
+        montage.paste(t, (x, 0))
+        x += t.width
+    palette_img = montage.quantize(colors=256, method=Image.MEDIANCUT)
+    frames = [c.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG) for c in canvases]
     buf = io.BytesIO()
     frames[0].save(
         buf, format="GIF", save_all=True, append_images=frames[1:],

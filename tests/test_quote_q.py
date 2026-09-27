@@ -489,3 +489,46 @@ def test_render_video_gif_from_reply_gif():
     assert out is not None
     from PIL import Image, ImageSequence
     assert sum(1 for _ in ImageSequence.Iterator(Image.open(io.BytesIO(out)))) == 2
+
+
+def test_gif_color_fidelity():
+    # Склейка не мнёт цвета: средние цвета правой части кадров ≈ исходным.
+    from utils.quote_image import render_info_strip_png, _stack_gif_side_by_side
+    strip = render_info_strip_png(sender_name="N", sender_id=1)
+    out = _stack_gif_side_by_side(_two_frame_gif(), strip, max_frames=10)
+    assert out is not None
+    from PIL import Image, ImageSequence
+    gif = Image.open(io.BytesIO(out))
+    W, H = gif.size
+    means = []
+    for f in ImageSequence.Iterator(gif):
+        rgb = f.convert("RGB")
+        x0 = W - 640  # апскейл x2 исходных 320px
+        crop = rgb.crop((x0 + 200, H // 2 - 20, x0 + 440, H // 2 + 20))
+        px = list(crop.getdata())
+        means.append(tuple(sum(c[i] for c in px) / len(px) for i in range(3)))
+    assert len(means) == 2
+    for got, want in zip(means, ((255, 0, 0), (0, 0, 255))):
+        assert all(abs(g - w) < 12 for g, w in zip(got, want)), (got, want)
+
+
+def test_gif_frames_upscaled():
+    from utils.quote_image import render_info_strip_png, _stack_gif_side_by_side
+    strip = render_info_strip_png(sender_name="N", sender_id=1)
+    out = _stack_gif_side_by_side(_two_frame_gif(), strip, max_frames=10)
+    from PIL import Image
+    # исходник 320px → апскейл x2 = 640 + плашка слева
+    assert Image.open(io.BytesIO(out)).size[0] > 640
+
+
+def test_body_lines_compact():
+    from utils.quote_image import BODY_LINE_HEIGHT
+    from PIL import Image
+    h1 = Image.open(io.BytesIO(render_quote_png(body="коротко", sender_name="N",
+                                                sender_id=1))).size[1]
+    h2 = Image.open(io.BytesIO(render_quote_png(body="слово " * 40, sender_name="N",
+                                                sender_id=1))).size[1]
+    assert h2 > h1  # перенос есть — текст на несколько строк
+    lines2 = (h2 - h1) // 1
+    # шаг высоты за строку текста ≈ BODY_LINE_HEIGHT, а не растянутые 120
+    assert (h2 - h1) % BODY_LINE_HEIGHT == 0 or abs((h2 - h1) - BODY_LINE_HEIGHT) < BODY_LINE_HEIGHT
