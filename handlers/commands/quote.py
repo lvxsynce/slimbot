@@ -200,15 +200,10 @@ async def handle(user_id: str, event) -> None:
             body = voice_body
             voice_attach = True
     if not body and not voice_attach:
-        # Медиа-цитата без текста: разрешаем если есть фото/видео —
-        # фоном станет само медиа, карточка — header без bubble.
-        if _reply_media_kind(reply) not in ("photo", "video"):
-            await event.edit(
-                "<b>Slim bot | Quote</b>\n<blockquote>[?] Сообщение без текста (медиа-only). "
-                "Цитировать нечего.</blockquote>",
-                parse_mode="html",
-            )
-            return
+        # Без текста цитируем само сообщение: карточка-шапка без bubble
+        # всегда уходит фоткой (фото/видео из реплая — фоном/GIF-кой ниже).
+        # Ветки «цитировать нечего» больше нет: любой реплай → фото.
+        body = ""
 
     body_text = _truncate(body)
 

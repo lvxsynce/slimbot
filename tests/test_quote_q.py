@@ -293,3 +293,61 @@ def test_caption_capped():
     cap = _build_caption("A", "B", "AB", 1, [f"user{i}" for i in range(50)], "d")
     assert len(cap) <= 1000
     assert "…и ещё" in cap
+
+
+def test_sticker_reply_becomes_photo_quote():
+    from handlers.commands.quote import handle
+
+    sent_files = []
+
+    class Reply:
+        raw_text = None
+        message = None
+        caption = None
+        photo = None
+        video = None
+        video_note = None
+        animation = None
+        gif = None
+        document = None
+        sticker = True
+        voice = None
+        date = None
+        fwd_from = None
+
+        async def get_sender(self):
+            return SimpleNamespace(id=77, username=None, first_name="Анна",
+                                   last_name=None, deleted=False)
+
+        async def download_media(self, file=None):
+            raise RuntimeError("nothing to download")
+
+    class Client:
+        async def __call__(self, *args, **kwargs):
+            raise RuntimeError("no mtproto")
+
+        async def send_file(self, chat_id, file, **kwargs):
+            sent_files.append((file, kwargs))
+            return SimpleNamespace(id=555)
+
+    class Event:
+        chat_id = -100
+        id = 2
+        message = None
+        client = Client()
+        edits = []
+        deleted = []
+
+        async def get_reply_message(self):
+            return Reply()
+
+        async def edit(self, text, **kwargs):
+            self.edits.append(text)
+
+        async def delete(self):
+            self.deleted.append(True)
+
+    asyncio.run(handle("u-sticker", ev := Event()))
+    assert len(sent_files) == 1
+    assert not ev.edits or "Цитировать нечего" not in ev.edits[0]
+    assert ev.deleted == [True]
