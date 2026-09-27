@@ -66,6 +66,153 @@ def _build_caption(first: str, last: str, fallback_name: str, sender_id, usernam
 
 _ANIMATED_STICKER_MIMES = {"application/x-tgsticker", "application/x-tgs-sticker"}
 
+# PUA-диапазон для маркеров custom emoji в тексте цитаты.
+_PUA_BASE = 0xE000
+_PUA_COUNT = 0xF8FF - 0xE000
+
+
+def _custom_emoji_spans(reply) -> list[tuple[int, int, int]]:
+    """[(offset, length, document_id)] custom emoji из entities. Pure.
+
+    Оффсеты Telegram — в UTF-16 code units (астральные эмодзи = 2 юнита).
+    """
+    spans = []
+    for ent in getattr(reply, "entities", None) or []:
+        if ent.__class__.__name__ != "MessageEntityCustomEmoji":
+            continue
+        doc_id = getattr(ent, "document_id", None)
+        if doc_id:
+            spans.append((
+                getattr(ent, "offset", 0) or 0,
+                getattr(ent, "length", 0) or 0,
+                doc_id,
+            ))
+    return spans
+
+
+def _apply_emoji_placeholders(text: str, spans: list[tuple[int, int, int]]
+                              ) -> tuple[str, dict[str, int]]:
+    """Заменяет диапазоны custom emoji на PUA-маркеры. Pure.
+
+    Возвращает (текст, {pua_char: document_id}). Битые диапазоны молча
+    пропускаются (плейсхолдер-эмодзи остаётся текстом).
+    """
+    if not text or not spans:
+        return text, {}
+    try:
+        units = text.encode("utf-16-le")
+    except Exception:
+        return text, {}
+    out = bytearray()
+    mapping: dict[str, int] = {}
+    idx = 0
+    pos = 0
+    for off, ln, doc_id in sorted(spans):
+        start, end = off * 2, (off + ln) * 2
+        if ln <= 0 or start < pos or end > len(units):
+            continue
+        out += units[pos:start]
+        pua = chr(_PUA_BASE + (idx % _PUA_COUNT))
+        idx += 1
+        out += pua.encode("utf-16-le")
+        mapping[pua] = doc_id
+        pos = end
+    out += units[pos:]
+    try:
+        return bytes(out).decode("utf-16-le"), mapping
+    except Exception:
+        return text, {}
+
+
+async def _decode_emoji_frame(data: bytes, mime: str):
+    """Первый кадр custom emoji → PIL RGBA Image. None если нечем (TGS/битое)."""
+    if not data:
+        return None
+    if (mime or "") in _ANIMATED_STICKER_MIMES:
+        return None  # TGS вектор — lottie нет, пропускаем
+    def _pillow():
+        try:
+            from PIL import Image
+            im = Image.open(__import__("io").BytesIO(data))
+            try:
+                if getattr(im, "is_animated", False):
+                    im.seek(0)
+            except Exception:
+                pass
+            im.thumbnail((128, 128))
+            return im.convert("RGBA")
+        except Exception:
+            return None
+    try:
+        loop = asyncio.get_running_loop()
+        img = await loop.run_in_executor(None, _pillow)
+    except Exception:
+        img = None
+    if img is not None:
+        return img
+    # Видео (webm/mp4) — первый кадр через ffmpeg.
+    try:
+        from utils.gif_converter import is_ffmpeg_available
+        if not is_ffmpeg_available():
+            return None
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-loglevel", "error", "-hide_banner", "-y",
+            "-i", "pipe:0", "-vframes", "1", "-f", "png", "pipe:1",
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(input=data), timeout=30)
+        except asyncio.TimeoutError:
+            proc.kill()
+            try:
+                await proc.wait()
+            except Exception:
+                pass
+            return None
+        if proc.returncode != 0 or not stdout:
+            return None
+        def _png():
+            try:
+                from PIL import Image
+                im = Image.open(__import__("io").BytesIO(stdout))
+                im.thumbnail((128, 128))
+                return im.convert("RGBA")
+            except Exception:
+                return None
+        return await loop.run_in_executor(None, _png)
+    except Exception:
+        return None
+
+
+async def _fetch_custom_emoji_images(client, doc_ids) -> dict:
+    """{document_id: PIL Image} для custom emoji. Ошибки/TGS пропускаются."""
+    res: dict = {}
+    ids = [i for i in dict.fromkeys(doc_ids or []) if i]
+    if not ids or client is None:
+        return res
+    try:
+        from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest
+        docs = await asyncio.wait_for(client(GetCustomEmojiDocumentsRequest(document_id=ids)), timeout=15)
+    except Exception as e:
+        logger.debug(f"quote: custom emoji fetch failed: {e}")
+        return res
+    for doc in docs or []:
+        doc_id = getattr(doc, "id", None)
+        if not doc_id or doc_id in res:
+            continue
+        try:
+            data = await asyncio.wait_for(
+                client.download_media(doc, file=bytes), timeout=20)
+            img = await _decode_emoji_frame(
+                data, getattr(doc, "mime_type", "") or "")
+            if img is not None:
+                res[doc_id] = img
+        except Exception as e:
+            logger.debug(f"quote: custom emoji doc {doc_id} failed: {e}")
+    return res
+
 
 def _reply_media_kind(reply) -> str | None:
     """Классификация media реплая для .q: 'video' | 'photo' | None.
@@ -169,7 +316,8 @@ def _scaled_video_size(card_png: bytes, max_width: int = 960) -> tuple[int, int]
         return 960, 540
 
 
-async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str):
+async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str,
+                       inline_images=None):
     """Info-плашка (слева от GIF-кадров) в executor'е. None если недоступно."""
     try:
         from utils.quote_image import render_info_strip_png, is_available as pillow_ok
@@ -184,6 +332,7 @@ async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, 
                 avatar_bytes=avatar_bytes,
                 timestamp=date_str,
                 body=body_text,
+                inline_images=inline_images,
             ),
         )
     except Exception as e:
@@ -191,7 +340,8 @@ async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, 
         return None
 
 
-async def _render_card_png(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str, background_bytes=None):
+async def _render_card_png(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str, background_bytes=None,
+                     inline_images=None):
     """PNG-карточка в executor'е (CPU-heavy Pillow). None если недоступно."""
     try:
         from utils.quote_image import render_quote_png, is_available as pillow_ok
@@ -207,6 +357,7 @@ async def _render_card_png(body_text, sender_name, sender_id, usernames_list, av
                 avatar_bytes=avatar_bytes,
                 timestamp=date_str,
                 background_bytes=background_bytes,
+                inline_images=inline_images,
             ),
         )
     except Exception as e:
@@ -260,10 +411,14 @@ async def handle(user_id: str, event) -> None:
         except Exception:
             pass
 
-    # Body — text or caption; голосовое без текста — заглушка с длительностью
-    body = (getattr(reply, "raw_text", "") or getattr(reply, "message", "") or "").strip()
-    if not body:
-        body = (getattr(reply, "caption", "") or "").strip()
+    # Body — text or caption. Custom (анимированные) emoji заменяем на
+    # PUA-маркеры ДО strip (оффсеты entities относятся к исходному тексту),
+    # картинки докачаем ниже и встроим в цитату как есть.
+    raw_source = (getattr(reply, "raw_text", "") or getattr(reply, "message", "") or "")
+    if not raw_source:
+        raw_source = (getattr(reply, "caption", "") or "")
+    raw_source, pua_to_doc = _apply_emoji_placeholders(raw_source, _custom_emoji_spans(reply))
+    body = raw_source.strip()
     # Звук детектим независимо от текста: аудио+подпись тоже идёт в видео.
     is_audio, audio_dur, audio_label = _audio_info(reply)
     audio_attach = bool(is_audio)
@@ -277,6 +432,21 @@ async def handle(user_id: str, event) -> None:
         body = ""
 
     body_text = _truncate(body)
+
+    # ---- Custom emoji: докачиваем кадры-стикеры, встраиваем в цитату ----
+    inline_images: dict = {}
+    if pua_to_doc:
+        try:
+            needed = {d for ch, d in pua_to_doc.items() if ch in body_text}
+            fetched = await asyncio.wait_for(
+                _fetch_custom_emoji_images(getattr(event, "client", None), needed),
+                timeout=40,
+            )
+            inline_images = {ch: fetched[d] for ch, d in pua_to_doc.items()
+                             if ch in body_text and d in fetched}
+        except Exception as e:
+            logger.debug(f"quote: custom emoji inline failed: {e}")
+            inline_images = {}
 
     # ---- Fetch avatar + usernames через TelethonManager ----
     avatar_bytes: bytes | None = None
@@ -371,7 +541,8 @@ async def handle(user_id: str, event) -> None:
     # Слева info-плашка (инфо + подпись), справа кадры из реплая.
     if video_bytes:
         png_card = await _render_info_strip(
-            body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str
+            body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str,
+            inline_images=inline_images,
         )
         if png_card:
             try:
@@ -408,7 +579,8 @@ async def handle(user_id: str, event) -> None:
     # войса рядом больше нет — звук живёт внутри видео.
     if audio_bytes:
         audio_card = await _render_card_png(
-            body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str
+            body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str,
+            inline_images=inline_images,
         )
         if audio_card:
             try:
@@ -452,6 +624,7 @@ async def handle(user_id: str, event) -> None:
     png_bytes = await _render_card_png(
         body_text, sender_name, sender_id, usernames_list,
         avatar_bytes, date_str, background_bytes,
+        inline_images=inline_images,
     )
     if png_bytes:
         try:
