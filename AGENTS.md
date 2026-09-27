@@ -150,7 +150,7 @@ Dot-команды работают в ДВУХ каналах:
 | `.unwatch` | `.хватит`, `.забыть` | Убрать чат/топик | aiogram + Telethon |
 | `.watched` | `.список` | Список отслеживаемых: id/title как кликабельные ссылки + топик, если есть | aiogram + Telethon |
 | `.help` | `.помощь` | Полная справка | aiogram + Telethon |
-| `.net` | `.сеть`, `.сет` | Автоматический анализ IP, домена или URL: DNS, Geo/ASN, TLS, редиректы и пассивный аудит связанных IP | aiogram + Telethon |
+| `.net` | `.сеть`, `.сет` | Автоматический анализ IP, домена или URL: DNS (сверка у Cloudflare/Google/Quad9), Geo/ASN, доступность сайта, title страницы, TLS, редиректы и пассивный аудит связанных IP; у IP — reverse DNS (PTR) | aiogram + Telethon |
 | `.hash` | `.хеш`, `.хэш` | md5/sha1/sha224/256/384/512/sha3_256/512/blake2b/blake2s — текста или файла по reply | aiogram + Telethon |
 | `.uuid` | `.юид` | До 20 UUIDv4 за раз | aiogram + Telethon |
 | `.b64` | `.base64` | base64 encode (`encode`/`e`/`enc`) или decode (`decode`/`d`/`dec`) | aiogram + Telethon |

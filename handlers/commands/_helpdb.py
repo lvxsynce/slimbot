@@ -66,7 +66,7 @@ HELPS: dict[str, dict[str, str]] = {
     },
     "net": {
         "syntax": ".net &lt;ip|domain|url&gt;",
-        "desc": "Единый автоматический анализ IP, домена или URL: DNS, Geo/ASN, статус, TLS и редиректы.",
+        "desc": "Единый автоматический анализ IP, домена или URL: DNS (включая сверку у Cloudflare/Google/Quad9), Geo/ASN, статус, доступность сайта, title страницы, TLS, редиректы и пассивный аудит.",
     },
     "del": {
         "syntax": ".del [N]  |  .удалить",

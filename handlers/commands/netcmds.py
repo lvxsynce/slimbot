@@ -10,7 +10,7 @@ from ._base import command_card, dispatch, thread_kwargs
 from utils.escape import esc
 from utils.hashing import ALGOS, b64_op, hash_bytes, hash_text, gen_uuids
 from utils.linkcheck import check as check_link, extract_url
-from utils.netinfo import dns_lookup, ip_info, passive_related_ips, unshorten
+from utils.netinfo import dns_lookup, ip_info, passive_related_ips, unshorten, dns_multi, http_probe, fetch_title
 from utils.texts import Texts, render_for_user
 
 router = Router()
@@ -53,6 +53,12 @@ async def _do_net(uid: str, args: str, reply_text: str | None = None) -> str:
             for key, label in (("city", "Город"), ("region", "Регион"), ("country", "Страна"), ("org", "ASN/провайдер"), ("timezone", "TZ")):
                 if info.get(key):
                     lines.append(f"{label}: <code>{esc(info[key])}</code>")
+        try:
+            ptr = await dns_lookup(ipaddress.ip_address(clean).reverse_pointer, "PTR")
+            if isinstance(ptr, list) and ptr:
+                lines.append(f"PTR: <code>{esc(ptr[0].rstrip('.'))}</code>")
+        except ValueError:
+            pass
         return command_card("Net", "\n".join(lines))
 
     from urllib.parse import urlsplit
@@ -63,21 +69,45 @@ async def _do_net(uid: str, args: str, reply_text: str | None = None) -> str:
 
     dns_results = await asyncio.gather(
         *(dns_lookup(host, record_type) for record_type in ("A", "AAAA", "MX", "NS")),
+        dns_multi(host),
+        http_probe(host),
         return_exceptions=True,
     )
+    *dns_only, multi_res, probe_res = dns_results
     lines = [f"Тип: {'URL' if kind == 'url' else 'домен'}", f"Цель: <code>{esc(clean)}</code>", f"Хост: <code>{esc(host)}</code>"]
     if kind == "url":
-        link_result = (await check_link(clean)).replace("<b>🔗 Проверка ссылки</b>", "Проверка URL")
+        link_result, title_info = await asyncio.gather(check_link(clean), fetch_title(clean))
+        link_result = (link_result).replace("<b>🔗 Проверка ссылки</b>", "Проверка URL")
         link_result = link_result.replace("✅", "").replace("⚠️", "").replace("❌", "")
         if link_result.startswith("<blockquote>") and link_result.endswith("</blockquote>"):
             link_result = link_result[len("<blockquote>"):-len("</blockquote>")]
         lines.append(link_result.strip())
+        if isinstance(title_info, dict):
+            if title_info.get("title"):
+                lines.append(f"Title: {esc(title_info['title'])}")
+            elif title_info.get("error"):
+                lines.append(f"Title: — ({esc(title_info['error'])})")
         redirects = await unshorten(clean)
         if isinstance(redirects, list) and len(redirects) > 1:
             lines.append("Редиректы: " + " → ".join(f"<code>{esc(item[:80])}</code>" for item in redirects))
-    for record_type, result in zip(("A", "AAAA", "MX", "NS"), dns_results):
+    for record_type, result in zip(("A", "AAAA", "MX", "NS"), dns_only):
         if isinstance(result, list) and result:
             lines.append(f"{record_type}: " + ", ".join(f"<code>{esc(value)}</code>" for value in result[:4]))
+
+    if isinstance(multi_res, dict) and multi_res:
+        lines.append("<b>DNS у резолверов:</b>")
+        for label, res in multi_res.items():
+            ips = res.get("ips") or []
+            if ips:
+                lines.append(f"• {esc(label)} <i>{res.get('ms', 0)}ms</i>: " + ", ".join(f"<code>{esc(ip)}</code>" for ip in ips[:3]))
+            else:
+                lines.append(f"• {esc(label)}: — ({esc(res.get('error') or 'нет данных')})")
+    if isinstance(probe_res, dict):
+        if probe_res.get("status") is not None:
+            srv = f" · {esc(probe_res['server'][:30])}" if probe_res.get("server") else ""
+            lines.append(f"Сайт: <code>{esc(probe_res.get('url', ''))}</code> → <code>{probe_res['status']}</code> <i>{probe_res.get('ms', 0)}ms</i>{srv}")
+        else:
+            lines.append(f"Сайт: недоступен ({esc(probe_res.get('error') or 'нет данных')})")
 
     passive = await passive_related_ips(host)
     current = set(passive.get("current_ips", []))
