@@ -181,7 +181,7 @@ def test_voice_body_and_duration():
 def test_video_note_is_video_kind():
     assert _reply_media_kind(SimpleNamespace(
         document=None, video=None, video_note=True, animation=None,
-        gif=None, photo=None, sticker=None)) == "video"
+        gif=None, photo=None, sticker=None)) is None  # кружки — статика
 
 
 def _sine_m4a(duration_s: float = 1.0) -> bytes | None:
@@ -564,9 +564,9 @@ def test_body_without_quote_marks():
     import utils.quote_image as qi
     seen = []
     orig = qi._draw_runs
-    def spy(draw, img, x, y, text, font, emoji_px, fill, bold=False, inline=None):
+    def spy(draw, img, x, y, text, font, emoji_px, fill, bold=False):
         seen.append(text)
-        return orig(draw, img, x, y, text, font, emoji_px, fill, bold=bold, inline=inline)
+        return orig(draw, img, x, y, text, font, emoji_px, fill, bold=bold)
     qi._draw_runs = spy
     try:
         render_quote_png(body="hello", sender_name="N", sender_id=1)
@@ -655,63 +655,9 @@ def test_body_lines_compact():
     assert (h2 - h1) % BODY_LINE_HEIGHT == 0 or abs((h2 - h1) - BODY_LINE_HEIGHT) < BODY_LINE_HEIGHT
 
 
-def test_custom_emoji_spans_extraction():
-    from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold
-    from handlers.commands.quote import _custom_emoji_spans
-    ents = [MessageEntityBold(offset=0, length=2),
-            MessageEntityCustomEmoji(offset=3, length=2, document_id=12345)]
-    spans = _custom_emoji_spans(SimpleNamespace(entities=ents))
-    assert spans == [(3, 2, 12345)]
-    assert _custom_emoji_spans(SimpleNamespace(entities=None)) == []
-    assert _custom_emoji_spans(SimpleNamespace()) == []
 
 
-def test_emoji_placeholders_utf16():
-    from handlers.commands.quote import _apply_emoji_placeholders
-    # '🔥' — астральный символ = 2 UTF-16 юнита; entity offset/length в юнитах
-    text, mapping = _apply_emoji_placeholders("hi 🔥 yo", [(3, 2, 999)])
-    assert len(mapping) == 1
-    pua, doc = next(iter(mapping.items()))
-    assert doc == 999
-    assert text == f"hi {pua} yo"
-    # битый диапазон — текст цел
-    text2, mapping2 = _apply_emoji_placeholders("hi", [(10, 2, 1)])
-    assert text2 == "hi" and mapping2 == {}
-    assert _apply_emoji_placeholders("", []) == ("", {})
 
-
-def test_inline_images_rendered():
-    from PIL import Image
-    red = Image.new("RGBA", (64, 64), color=(255, 0, 0, 255))
-    out = render_quote_png(body="hi  bye", sender_name="N", sender_id=1,
-                           inline_images={"": red})
-    assert out is not None
-    im = Image.open(io.BytesIO(out)).convert("RGB")
-    # красный пиксель inline-картинки в правой колонке (бокс с x=560)
-    found = False
-    for x in range(560, im.width, 10):
-        for y in range(0, im.height, 10):
-            r, g, b = im.getpixel((x, y))
-            if r > 200 and g < 80 and b < 80:
-                found = True
-                break
-    assert found
-
-
-def test_inline_affects_width():
-    from utils.quote_image import _resolve_font, _wrap_text, BODY_FONT_SIZE
-    font = _resolve_font(BODY_FONT_SIZE, "hi")
-    from PIL import Image
-    red = Image.new("RGBA", (100, 50), color=(255, 0, 0, 255))
-    w_plain = _wrap_text("ab", font, max_width=5000, emoji_px=BODY_FONT_SIZE)
-    w_inline = _wrap_text("ab", font, max_width=5000, emoji_px=BODY_FONT_SIZE,
-                          inline={"": red})
-    assert w_plain == w_inline == ["ab"]  # одна строка в обоих случаях
-
-
-def test_unknown_pua_skipped_no_crash():
-    out = render_quote_png(body="hi  bye", sender_name="N", sender_id=1)
-    assert out is not None and len(out) > 1000
 
 
 def test_extended_emoji_ranges_kept():
@@ -741,85 +687,67 @@ def test_left_column_lines_do_not_overlap():
     assert len(blocks) >= 5, blocks
 
 
-def test_placeholders_only_when_available():
-    from handlers.commands.quote import _apply_emoji_placeholders
-    spans = [(3, 2, 111), (8, 2, 222)]
-    text, mapping = _apply_emoji_placeholders("hi 🔥 yo 🎉!", spans, {111})
-    assert list(mapping.values()) == [111]
-    assert "🎉" in text  # не скачалось — исходный символ на месте
-    assert "🔥" not in text
 
 
-def test_fetch_custom_emoji_tgs_thumb():
-    import asyncio
-    from handlers.commands.quote import _fetch_custom_emoji
-
-    webp = _png_bytes((10, 200, 90), size=(100, 100))
-
-    class Client:
-        async def __call__(self, req):
-            assert req.__class__.__name__ == "GetCustomEmojiDocumentsRequest"
-            return [SimpleNamespace(id=777, mime_type="application/x-tgsticker")]
-
-        async def download_media(self, doc, file=None, thumb=None):
-            assert thumb == -1  # TGS качаем thumb с сервера, не вектор
-            return webp
-
-    res = asyncio.run(_fetch_custom_emoji(Client(), [777]))
-    assert 777 in res
-    assert len(res[777]["frames"]) == 1
 
 
-def test_fetch_custom_emoji_webm_frames():
-    import asyncio
-    import subprocess
-    from handlers.commands.quote import _fetch_custom_emoji
-    from utils.gif_converter import is_ffmpeg_available
-    if not is_ffmpeg_available():
-        import pytest
-        pytest.skip("no ffmpeg")
-    p = subprocess.run(
-        ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-         "-f", "lavfi", "-i", "testsrc=duration=0.5:size=100x100:rate=10",
-         "-c:v", "libvpx-vp9", "-f", "webm", "pipe:1"],
-        capture_output=True, timeout=60)
-    assert p.stdout, "synth webm failed"
+
+def test_video_note_is_static_with_stub():
+    from handlers.commands.quote import _reply_media_kind, handle
+    vn = SimpleNamespace(video_note=SimpleNamespace(size=1000))
+    assert _reply_media_kind(vn) is None  # кружки — без GIF-пути
+
+    sent_files = []
+    deleted = []
+
+    class Reply:
+        raw_text = None
+        message = None
+        caption = None
+        photo = None
+        video = None
+        video_note = SimpleNamespace(size=1000)
+        animation = None
+        gif = None
+        document = None
+        sticker = None
+        audio = None
+        voice = None
+        date = None
+        fwd_from = None
+        entities = None
+
+        async def get_sender(self):
+            return SimpleNamespace(id=5, username=None, first_name="К",
+                                   last_name=None, deleted=False)
+
+        async def download_media(self, file=None):
+            raise AssertionError("video note must not be downloaded")
 
     class Client:
-        async def __call__(self, req):
-            return [SimpleNamespace(id=888, mime_type="video/webm")]
+        async def __call__(self, *args, **kwargs):
+            raise RuntimeError("no mtproto")
 
-        async def download_media(self, doc, file=None, thumb=None):
-            assert thumb is None
-            return p.stdout
+        async def send_file(self, chat_id, file, **kwargs):
+            sent_files.append((file, kwargs))
+            return SimpleNamespace(id=111)
 
-    res = asyncio.run(_fetch_custom_emoji(Client(), [888]))
-    assert 888 in res
-    assert len(res[888]["frames"]) > 1  # анимация разобрана покадрово
+    class Event:
+        chat_id = -100
+        id = 9
+        message = None
+        client = Client()
 
+        async def get_reply_message(self):
+            return Reply()
 
-def test_select_anim_phases():
-    from handlers.commands.quote import _select_anim_phases
-    assert _select_anim_phases(0) == []
-    assert _select_anim_phases(1) == [0]
-    assert _select_anim_phases(4) == [0, 1, 2, 3]
-    ph = _select_anim_phases(36)
-    assert len(ph) == 8 and ph[0] == 0 and ph[-1] == 35
+        async def edit(self, text, **kwargs):
+            pass
 
+        async def delete(self):
+            deleted.append(True)
 
-def test_stack_anim_strips_change_over_time():
-    from utils.quote_image import (
-        render_info_strip_png, _stack_gif_side_by_side)
-    s1 = render_info_strip_png(sender_name="N", sender_id=1, body="phase one")
-    s2 = render_info_strip_png(sender_name="N", sender_id=1, body="phase two is longer here")
-    assert s1 != s2
-    out = _stack_gif_side_by_side(_two_frame_gif(), s1, max_frames=10,
-                                  anim_strips=[s1, s2], anim_duration_ms=300)
-    assert out is not None
-    from PIL import Image, ImageSequence
-    frames = [f.convert("RGB") for f in ImageSequence.Iterator(Image.open(io.BytesIO(out)))]
-    assert len(frames) == 2
-    # фазы разные → левые части кадров различаются
-    import hashlib
-    h = [hashlib.md5(f.crop((0, 0, 100, f.height)).tobytes()).hexdigest() for f in frames]
-    assert h[0] != h[1]
+    asyncio.run(handle("u-note", Event()))
+    assert len(sent_files) == 1  # одна статичная карточка, без видео
+    assert getattr(sent_files[0][0], "name", "") == "quote.png"
+    assert deleted == [True]

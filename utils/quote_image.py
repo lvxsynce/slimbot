@@ -431,32 +431,13 @@ def _emoji_glyph(ch: str, px: int):
     return out
 
 
-def _is_pua(ch: str) -> bool:
-    """Private-use маркер custom emoji (\uE000–\uF8FF)."""
-    return len(ch) == 1 and 0xE000 <= ord(ch) <= 0xF8FF
-
-
-def _inline_advance(im, px: int) -> int:
-    """Ширина inline-картинки при высоте px (aspect preserved)."""
-    try:
-        return max(1, int(im.width * max(1, int(px)) / max(im.height, 1)))
-    except Exception:
-        return int(px)
-
-
-def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int, bold: bool = False,
-                inline: dict | None = None) -> float:
-    """Ширина строки: inline-картинки, emoji-глифы, текст через font-fallback."""
+def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int, bold: bool = False) -> float:
+    """Ширина строки: текст — посимвольно через font-fallback chain, emoji — глифы."""
     size = getattr(font, "size", emoji_px) or emoji_px
     total = 0.0
     for kind, chunk in runs:
         if kind == "t":
             for ch in chunk:
-                if inline and ch in inline:
-                    total += _inline_advance(inline[ch], emoji_px)
-                    continue
-                if _is_pua(ch):
-                    continue  # картинка не скачалась — молча пропускаем, не tofu
                 if ch not in _EMOJI_SKIP and _EMOJI_RUN_RE.match(ch):
                     g = _emoji_glyph(ch, emoji_px)
                     if g is not None:
@@ -476,8 +457,8 @@ def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int, bold: bool = F
 
 
 def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fill,
-               bold: bool = False, inline: dict | None = None) -> float:
-    """Рисует строку: inline-картинки + цветные emoji + текст (font-fallback).
+               bold: bool = False) -> float:
+    """Рисует строку: цветные emoji + текст (посимвольный font-fallback).
 
     Возвращает x конца. Baseline: глифы вписываются в высоту строки
     (emoji_px ≈ размер шрифта).
@@ -487,23 +468,6 @@ def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fi
     for kind, chunk in _segment_runs(text):
         if kind == "t":
             for ch in chunk:
-                if inline and ch in inline:
-                    try:
-                        im = inline[ch]
-                        h = max(1, int(emoji_px))
-                        w = _inline_advance(im, h)
-                        r = im if (im.width == w and im.height == h) else im.resize((w, h))
-                        top = int(y + max(0, (font.size if hasattr(font, "size") else emoji_px) - h))
-                        if r.mode in ("RGBA", "LA"):
-                            img.paste(r, (int(cx), top), mask=r.split()[-1])
-                        else:
-                            img.paste(r, (int(cx), top))
-                    except Exception:
-                        pass
-                    cx += _inline_advance(inline[ch], emoji_px)
-                    continue
-                if _is_pua(ch):
-                    continue
                 if ch not in _EMOJI_SKIP and _EMOJI_RUN_RE.match(ch):
                     g = _emoji_glyph(ch, emoji_px)
                     if g is not None:
@@ -534,8 +498,7 @@ def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fi
     return cx
 
 
-def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bold: bool = False,
-               inline: dict | None = None) -> list[str]:
+def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bold: bool = False) -> list[str]:
     """Word-wrap text → list of strings длиной до max_width pixels.
 
     Слова длиннее max_width бьются посимвольно — иначе строка
@@ -548,7 +511,7 @@ def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bol
     px = emoji_px if emoji_px is not None else (getattr(font, "size", 24) or 24)
 
     def _measure(s: str) -> float:
-        return _runs_width(_segment_runs(s), font, px, bold, inline)
+        return _runs_width(_segment_runs(s), font, px, bold)
 
     def _break_long(word: str) -> list[str]:
         parts, cur = [], ""
@@ -645,7 +608,6 @@ def render_quote_png(
     avatar_bytes: bytes | None = None,
     timestamp: str = "",
     background_bytes: bytes | None = None,
-    inline_images: dict | None = None,
 ) -> bytes | None:
     """Render прямоугольной PNG-цитаты с avatar + bubble overlay.
 
@@ -745,7 +707,7 @@ def render_quote_png(
     right_text_w = right_w - 2 * BUBBLE_TEXT_PAD_X
     quoted = body_text
     body_lines = _wrap_text(quoted, body_font, max_width=right_text_w,
-                            emoji_px=BODY_FONT_SIZE, inline=inline_images)
+                            emoji_px=BODY_FONT_SIZE)
     if len(body_lines) > MAX_BODY_LINES:
         body_lines = body_lines[:MAX_BODY_LINES]
         if body_lines:
@@ -787,14 +749,12 @@ def render_quote_png(
         ly += AVATAR_SIZE + _gap // 2
     for line in name_lines:
         _draw_runs(draw, img, lx, ly + (_name_lh - NAME_FONT_SIZE) // 2,
-                   line, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True,
-                   inline=inline_images)
+                   line, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
         ly += _name_lh
     ly += _gap // 2
     for line in info_lines:
         _draw_runs(draw, img, lx, ly + (_info_lh - INFO_FONT_SIZE) // 2,
-                   line, info_font, INFO_FONT_SIZE, INFO_COLOR,
-                   inline=inline_images)
+                   line, info_font, INFO_FONT_SIZE, INFO_COLOR)
         ly += _info_lh
 
     # --- Правый бокс: фон на всю правую часть + фото + текст ---
@@ -819,8 +779,7 @@ def render_quote_png(
         tx = right_x + BUBBLE_TEXT_PAD_X
         for line in body_lines:
             _draw_runs(draw, img, tx, cy + (_body_lh - BODY_FONT_SIZE) // 2,
-                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR,
-                       inline=inline_images)
+                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
             cy += _body_lh
 
     buf = io.BytesIO()
@@ -840,7 +799,6 @@ def render_info_strip_png(
     timestamp: str = "",
     body: str = "",
     width: int = STRIP_WIDTH,
-    inline_images: dict | None = None,
 ) -> bytes | None:
     """Узкая вертикальная info-плашка для GIF-цитат: слева от кадров.
 
@@ -893,7 +851,7 @@ def render_info_strip_png(
         )
     quoted = body_text
     body_lines = _wrap_text(quoted, body_font, max_width=text_w,
-                            emoji_px=BODY_FONT_SIZE, inline=inline_images)
+                            emoji_px=BODY_FONT_SIZE)
     if len(body_lines) > MAX_BODY_LINES:
         body_lines = body_lines[:MAX_BODY_LINES]
         if body_lines:
@@ -918,21 +876,18 @@ def render_info_strip_png(
         y += AVATAR_SIZE + gap // 2
     for line in name_lines:
         _draw_runs(draw, img, pad, y + (name_lh - NAME_FONT_SIZE) // 2,
-                   line, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True,
-                   inline=inline_images)
+                   line, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
         y += name_lh
     y += gap // 2
     for line in info_lines:
         _draw_runs(draw, img, pad, y + (info_lh - INFO_FONT_SIZE) // 2,
-                   line, info_font, INFO_FONT_SIZE, INFO_COLOR,
-                   inline=inline_images)
+                   line, info_font, INFO_FONT_SIZE, INFO_COLOR)
         y += info_lh
     if body_lines:
         y += gap // 2
         for line in body_lines:
             _draw_runs(draw, img, pad, y + (body_lh - BODY_FONT_SIZE) // 2,
-                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR,
-                       inline=inline_images)
+                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
             y += body_lh
 
     buf = io.BytesIO()
@@ -966,8 +921,7 @@ def _as_gif_direct(data: bytes) -> bytes | None:
 
 
 def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40,
-                            max_width: int = 800, anim_strips: list | None = None,
-                            anim_duration_ms: int = 0) -> bytes | None:
+                            max_width: int = 800) -> bytes | None:
     """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами.
 
     Качество:
@@ -975,34 +929,17 @@ def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int 
       итог заметно больше исходной гифки;
     - ОДНА общая 256-палитра на все кадры (MEDIANCUT по монтаж-тамбнейлам +
       FLOYDSTEINBERG): без этого покадровые палитры дают грязь и мерцание.
-    Анимация эмодзи: `anim_strips` — плашки по фазам (равномерно по циклу
-    `anim_duration_ms`); каждый кадр берёт фазу по своему времени.
     """
     from PIL import Image, ImageSequence
 
     gif = Image.open(io.BytesIO(gif_bytes))
-    base_strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
-    phase_strips = []
-    if anim_strips and anim_duration_ms > 0:
-        for s in anim_strips:
-            try:
-                phase_strips.append(Image.open(io.BytesIO(s)).convert("RGB"))
-            except Exception:
-                pass
-        if not phase_strips:
-            anim_duration_ms = 0
+    strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
     canvases: list = []
     durations: list[int] = []
-    t_cum = 0
     for i, frame in enumerate(ImageSequence.Iterator(gif)):
         if i >= max_frames:
             break
         dur = int(frame.info.get("duration", 100)) or 100
-        strip = base_strip
-        if phase_strips:
-            ph = int((t_cum % anim_duration_ms) / anim_duration_ms * len(phase_strips))
-            strip = phase_strips[min(ph, len(phase_strips) - 1)]
-        t_cum += dur
         fr = frame.convert("RGB")
         w, h = fr.size
         if w < max_width:
@@ -1085,13 +1022,12 @@ async def render_video_quote_gif(
     fps: int = 12,
     duration_s: float = 4.0,
     timeout_s: float = 60.0,
-    anim_strips: list | None = None,
-    anim_duration_ms: int = 0,
 ) -> bytes | None:
     """Видео/гифка из реплая справа + info-плашка слева → анимированная GIF.
 
     Если bytes уже GIF (реплай-гифка) — кадры берутся напрямую через Pillow
-    без ffmpeg. Видео (mp4/кружки) конвертируются через ffmpeg, если он есть.
+    без ffmpeg. Видео (mp4) конвертируются через ffmpeg, если он есть.
+    Кружки (video_note) сюда не доходят — только статичная карточка.
 
     Returns None если нет кадров / encode упал / итог тяжелее лимита —
     caller падает на статичную PNG-цитату.
@@ -1117,6 +1053,6 @@ async def render_video_quote_gif(
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, _stack_gif_side_by_side, gif, card_png_bytes, max_frames,
-            max_width, anim_strips, anim_duration_ms)
+            max_width)
     except Exception:
         return None
