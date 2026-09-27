@@ -108,16 +108,65 @@ def _voice_duration(reply) -> int | None:
     return None
 
 
+def _fmt_dur(seconds) -> str | None:
+    """75 → '1:15', 8 → '8 сек'. None если длительность неизвестна."""
+    if not isinstance(seconds, (int, float)) or seconds <= 0:
+        return None
+    s = int(seconds)
+    minutes, sec = divmod(s, 60)
+    return f"{minutes}:{sec:02d}" if minutes else f"{sec} сек"
+
+
+def _audio_info(reply) -> tuple[bool, float | None, str]:
+    """Голосовое или музыка: (есть_звук, длительность, подпись). Pure.
+
+    Ловит и `reply.voice`, и `reply.audio`/документ с audio-mime или
+    DocumentAttributeAudio (треки с названием/исполнителем).
+    """
+    if getattr(reply, "voice", None):
+        return True, _voice_duration(reply), "🎤 Голосовое сообщение"
+    doc = getattr(reply, "document", None)
+    mime = (getattr(doc, "mime_type", "") or "") if doc else ""
+    audio_attr = None
+    for attr in getattr(doc, "attributes", None) or []:
+        if attr.__class__.__name__ == "DocumentAttributeAudio":
+            audio_attr = attr
+            break
+    if getattr(reply, "audio", None) is not None or audio_attr is not None or mime.startswith("audio/"):
+        dur = getattr(audio_attr, "duration", None)
+        dur = dur if isinstance(dur, (int, float)) and dur > 0 else None
+        title = getattr(audio_attr, "title", None)
+        perf = getattr(audio_attr, "performer", None)
+        if title and perf:
+            label = f"🎵 {perf} — {title}"
+        elif title:
+            label = f"🎵 {title}"
+        else:
+            label = "🎵 Аудио"
+        return True, dur, label
+    return False, None, ""
+
+
 def _voice_body(reply) -> str | None:
     """Текст-заглушка для цитаты голосового. None если это не войс."""
     if not getattr(reply, "voice", None):
         return None
-    duration = _voice_duration(reply)
-    if duration:
-        minutes, seconds = divmod(duration, 60)
-        length = f"{minutes}:{seconds:02d}" if minutes else f"{seconds} сек"
-        return f"🎤 Голосовое сообщение ({length})"
-    return "🎤 Голосовое сообщение"
+    is_audio, dur, label = _audio_info(reply)
+    d = _fmt_dur(dur)
+    return f"{label} ({d})" if d else label
+
+
+def _scaled_video_size(card_png: bytes, max_width: int = 960) -> tuple[int, int]:
+    """Размер кадра после builder-scale (min(960,iw) × чётная высота). Pure."""
+    try:
+        import io as _io
+        from PIL import Image
+        w, h = Image.open(_io.BytesIO(card_png)).size
+        vw = min(max_width, w)
+        vh = int(h * vw / max(w, 1)) // 2 * 2
+        return max(2, vw), max(2, vh)
+    except Exception:
+        return 960, 540
 
 
 async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str):
@@ -215,13 +264,13 @@ async def handle(user_id: str, event) -> None:
     body = (getattr(reply, "raw_text", "") or getattr(reply, "message", "") or "").strip()
     if not body:
         body = (getattr(reply, "caption", "") or "").strip()
-    voice_attach = False
-    if not body:
-        voice_body = _voice_body(reply)
-        if voice_body:
-            body = voice_body
-            voice_attach = True
-    if not body and not voice_attach:
+    # Звук детектим независимо от текста: аудио+подпись тоже идёт в видео.
+    is_audio, audio_dur, audio_label = _audio_info(reply)
+    audio_attach = bool(is_audio)
+    if not body and is_audio:
+        d = _fmt_dur(audio_dur)
+        body = f"{audio_label} ({d})" if d else audio_label
+    if not body and not audio_attach:
         # Без текста цитируем само сообщение: карточка-шапка без bubble
         # всегда уходит фоткой (фото/видео из реплая — фоном/GIF-кой ниже).
         # Ветки «цитировать нечего» больше нет: любой реплай → фото.
@@ -289,10 +338,10 @@ async def handle(user_id: str, event) -> None:
     # в шапке). Цитата уходит только фоткой, без текста под ней. ----
     # _build_caption оставлен для совместимости (тесты), но не используется.
 
-    # ---- Классификация media реплая: фон (фото) / GIF-путь (видео, incl. кружки) / войс ----
+    # ---- Классификация media реплая: фон (фото) / GIF-путь (видео, incl. кружки) / звук ----
     background_bytes: bytes | None = None
     video_bytes: bytes | None = None
-    voice_bytes: bytes | None = None
+    audio_bytes: bytes | None = None
     try:
         media_kind = _reply_media_kind(reply)
         if media_kind == "video":
@@ -306,10 +355,15 @@ async def handle(user_id: str, event) -> None:
                 video_bytes = await reply.download_media(file=bytes)
         elif media_kind == "photo":
             background_bytes = await reply.download_media(file=bytes)
-        if voice_attach:
-            vsize = getattr(getattr(reply, "voice", None), "size", None)
-            if not vsize or vsize <= QUOTE_VIDEO_MAX_BYTES:
-                voice_bytes = await reply.download_media(file=bytes)
+        if audio_attach:
+            asize = None
+            for holder in (getattr(reply, "voice", None), getattr(reply, "document", None),
+                           getattr(reply, "audio", None)):
+                asize = getattr(holder, "size", None)
+                if asize:
+                    break
+            if not asize or asize <= QUOTE_VIDEO_MAX_BYTES:
+                audio_bytes = await reply.download_media(file=bytes)
     except Exception as e:
         logger.debug(f"quote: reply media download failed: {e}")
 
@@ -349,6 +403,50 @@ async def handle(user_id: str, event) -> None:
                 except Exception as e:
                     logger.warning(f"quote: GIF send failed, falling back to PNG: {e}")
 
+    # ---- Попытка 0.5: видео-цитата (голосовое/аудио) ----
+    # Один файл: кадр-карточка (инфо + текст) + звук внутри. Отдельного
+    # войса рядом больше нет — звук живёт внутри видео.
+    if audio_bytes:
+        audio_card = await _render_card_png(
+            body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str
+        )
+        if audio_card:
+            try:
+                from utils.gif_converter import image_audio_to_video_bytes
+                clip = await image_audio_to_video_bytes(audio_card, audio_bytes)
+            except Exception as e:
+                logger.debug(f"quote: audio video render failed: {e}")
+                clip = None
+            if clip:
+                try:
+                    from telethon.tl.types import DocumentAttributeVideo
+                    from utils.telethon_manager import telethon_reply_to
+                    import io
+                    vw, vh = _scaled_video_size(audio_card)
+                    buf = io.BytesIO(clip)
+                    buf.name = "quote.mp4"
+                    await event.client.send_file(
+                        event.chat_id,
+                        file=buf,
+                        reply_to=telethon_reply_to(event),
+                        force_document=False,
+                        supports_streaming=True,
+                        attributes=[DocumentAttributeVideo(
+                            duration=max(1, int(audio_dur or 0)),
+                            w=vw,
+                            h=vh,
+                            round_message=False,
+                            supports_streaming=True,
+                        )],
+                    )
+                    try:
+                        await event.delete()
+                    except Exception as e:
+                        logger.debug(f"quote: delete origin failed: {e}")
+                    return
+                except Exception as e:
+                    logger.warning(f"quote: audio video send failed, falling back: {e}")
+
     # ---- Попытка 1: PNG render + send_file ----
     sent = False
     png_bytes = await _render_card_png(
@@ -368,21 +466,28 @@ async def handle(user_id: str, event) -> None:
                 force_document=False,
             )
             sent = True
-            # Цитата с голосовым: прикладываем оригинальный войс ответом на цитату.
-            if voice_bytes:
+            # Видео-цитата не собралась (нет ffmpeg) — прикладываем оригинал
+            # звука ответом на цитату, как раньше.
+            if audio_bytes:
                 try:
                     import io as _io
-                    vbuf = _io.BytesIO(voice_bytes)
-                    vbuf.name = "voice.ogg"
+                    is_voice = getattr(reply, "voice", None) is not None
+                    mime = (getattr(getattr(reply, "document", None), "mime_type", "") or "")
+                    ext = ".ogg" if is_voice else (
+                        ".mp3" if mime == "audio/mpeg" else
+                        ".m4a" if mime in ("audio/mp4", "audio/x-m4a") else
+                        ".ogg" if mime in ("audio/ogg", "audio/opus") else ".bin")
+                    vbuf = _io.BytesIO(audio_bytes)
+                    vbuf.name = ("voice" if is_voice else "audio") + ext
                     quote_id = getattr(quote_msg, "id", None)
                     await event.client.send_file(
                         event.chat_id,
                         file=vbuf,
                         reply_to=quote_id,
-                        voice_note=True,
+                        voice_note=is_voice,
                     )
                 except Exception as e:
-                    logger.debug(f"quote: voice attach failed: {e}")
+                    logger.debug(f"quote: audio attach failed: {e}")
         except Exception as e:
             logger.warning(f"quote: PNG send failed, falling back to HTML: {e}")
 

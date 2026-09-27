@@ -299,3 +299,87 @@ async def video_to_gif_bytes(
         logger.debug("video_to_gif_bytes: ffmpeg returned empty stdout")
         return None
     return stdout
+
+
+async def image_audio_to_video_bytes(
+    card_png: bytes,
+    audio_bytes: bytes,
+    *,
+    max_width: int = 960,
+    fps: int = 2,
+    timeout_s: float = 120.0,
+) -> bytes | None:
+    """Статичная карточка + звук → MP4 (видео-цитата для голосовых/аудио).
+
+    Кадр зациклен на всю длину аудио (``-loop 1 -shortest``), видео —
+    libx264 ultrafast, звук — AAC. Возвращает MP4 bytes или None
+    (нет ffmpeg / encode упал / таймаут).
+    """
+    if not card_png or not audio_bytes:
+        return None
+    if not is_ffmpeg_available():
+        return None
+    import asyncio as _asyncio
+    import os as _os
+    import tempfile as _tempfile
+    # Картинку кладём во временный файл (два stdin-пайпа через
+    # communicate не скормить), аудио идёт в stdin.
+    tmp = None
+    try:
+        fd, tmp = _tempfile.mkstemp(suffix=".png", prefix="qcard_")
+        with _os.fdopen(fd, "wb") as f:
+            f.write(card_png)
+        cmd2 = [
+            "ffmpeg",
+            "-loglevel", "error",
+            "-hide_banner",
+            "-y",
+            "-loop", "1",
+            "-framerate", str(fps),
+            "-i", tmp,
+            "-i", "pipe:0",
+            "-map", "0:v",
+            "-map", "1:a",
+            "-vf", f"scale='min({max_width},iw)':-2:flags=lanczos,format=yuv420p",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "96k",
+            "-shortest",
+            "-movflags", "frag_keyframe+empty_moov",
+            "-f", "mp4",
+            "pipe:1",
+        ]
+        proc2 = await _asyncio.create_subprocess_exec(
+            *cmd2,
+            stdin=_asyncio.subprocess.PIPE,
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        try:
+            stdout, stderr = await _asyncio.wait_for(
+                proc2.communicate(input=audio_bytes),
+                timeout=timeout_s,
+            )
+        except _asyncio.TimeoutError:
+            proc2.kill()
+            try:
+                await proc2.wait()
+            except Exception:
+                pass
+            logger.warning("image_audio_to_video_bytes: ffmpeg timeout")
+            return None
+        if proc2.returncode != 0:
+            msg = stderr.decode("utf-8", errors="replace").strip()[-200:]
+            logger.debug(f"image_audio_to_video_bytes: ffmpeg failed: {msg}")
+            return None
+        if not stdout:
+            return None
+        return stdout
+    finally:
+        if tmp:
+            try:
+                _os.remove(tmp)
+            except Exception:
+                pass
