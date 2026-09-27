@@ -120,6 +120,28 @@ def _voice_body(reply) -> str | None:
     return "🎤 Голосовое сообщение"
 
 
+async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str):
+    """Info-плашка (слева от GIF-кадров) в executor'е. None если недоступно."""
+    try:
+        from utils.quote_image import render_info_strip_png, is_available as pillow_ok
+        if not pillow_ok():
+            return None
+        return await asyncio.get_running_loop().run_in_executor(
+            None,
+            lambda: render_info_strip_png(
+                sender_name=sender_name,
+                sender_id=sender_id,
+                usernames=usernames_list,
+                avatar_bytes=avatar_bytes,
+                timestamp=date_str,
+                body=body_text,
+            ),
+        )
+    except Exception as e:
+        logger.warning(f"quote: info strip render failed: {type(e).__name__}: {e}")
+        return None
+
+
 async def _render_card_png(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str, background_bytes=None):
     """PNG-карточка в executor'е (CPU-heavy Pillow). None если недоступно."""
     try:
@@ -292,8 +314,9 @@ async def handle(user_id: str, event) -> None:
         logger.debug(f"quote: reply media download failed: {e}")
 
     # ---- Попытка 0: GIF-цитата (видео/анимация/GIF в реплае) ----
+    # Слева info-плашка (инфо + подпись), справа кадры из реплая.
     if video_bytes:
-        png_card = await _render_card_png(
+        png_card = await _render_info_strip(
             body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str
         )
         if png_card:
