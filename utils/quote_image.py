@@ -966,7 +966,8 @@ def _as_gif_direct(data: bytes) -> bytes | None:
 
 
 def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40,
-                            max_width: int = 800) -> bytes | None:
+                            max_width: int = 800, anim_strips: list | None = None,
+                            anim_duration_ms: int = 0) -> bytes | None:
     """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами.
 
     Качество:
@@ -974,16 +975,34 @@ def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int 
       итог заметно больше исходной гифки;
     - ОДНА общая 256-палитра на все кадры (MEDIANCUT по монтаж-тамбнейлам +
       FLOYDSTEINBERG): без этого покадровые палитры дают грязь и мерцание.
+    Анимация эмодзи: `anim_strips` — плашки по фазам (равномерно по циклу
+    `anim_duration_ms`); каждый кадр берёт фазу по своему времени.
     """
     from PIL import Image, ImageSequence
 
     gif = Image.open(io.BytesIO(gif_bytes))
-    strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
+    base_strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
+    phase_strips = []
+    if anim_strips and anim_duration_ms > 0:
+        for s in anim_strips:
+            try:
+                phase_strips.append(Image.open(io.BytesIO(s)).convert("RGB"))
+            except Exception:
+                pass
+        if not phase_strips:
+            anim_duration_ms = 0
     canvases: list = []
     durations: list[int] = []
+    t_cum = 0
     for i, frame in enumerate(ImageSequence.Iterator(gif)):
         if i >= max_frames:
             break
+        dur = int(frame.info.get("duration", 100)) or 100
+        strip = base_strip
+        if phase_strips:
+            ph = int((t_cum % anim_duration_ms) / anim_duration_ms * len(phase_strips))
+            strip = phase_strips[min(ph, len(phase_strips) - 1)]
+        t_cum += dur
         fr = frame.convert("RGB")
         w, h = fr.size
         if w < max_width:
@@ -996,7 +1015,7 @@ def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int 
         canvas.paste(strip_small, (0, 0))
         canvas.paste(fr, (strip_w, 0))
         canvases.append(canvas)
-        durations.append(int(frame.info.get("duration", 100)) or 100)
+        durations.append(dur)
     if len(canvases) < 2:
         return None
     # Общая палитра: монтаж ужатых копий → MEDIANCUT → один набор цветов.
@@ -1066,6 +1085,8 @@ async def render_video_quote_gif(
     fps: int = 12,
     duration_s: float = 4.0,
     timeout_s: float = 60.0,
+    anim_strips: list | None = None,
+    anim_duration_ms: int = 0,
 ) -> bytes | None:
     """Видео/гифка из реплая справа + info-плашка слева → анимированная GIF.
 
@@ -1094,6 +1115,8 @@ async def render_video_quote_gif(
         return None
     try:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _stack_gif_side_by_side, gif, card_png_bytes, max_frames)
+        return await loop.run_in_executor(
+            None, _stack_gif_side_by_side, gif, card_png_bytes, max_frames,
+            max_width, anim_strips, anim_duration_ms)
     except Exception:
         return None
