@@ -184,9 +184,59 @@ def test_video_note_is_video_kind():
         gif=None, photo=None, sticker=None)) == "video"
 
 
-def test_quote_with_voice_attaches_voice():
-    from handlers.commands.quote import handle
+def _sine_m4a(duration_s: float = 1.0) -> bytes | None:
+    """Синтезирует секундный тон в m4a через ffmpeg. None если нет ffmpeg."""
+    import subprocess
+    try:
+        p = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+             "-f", "lavfi", "-i", f"sine=frequency=440:duration={duration_s}",
+             "-c:a", "aac", "-movflags", "frag_keyframe+empty_moov",
+             "-f", "mp4", "pipe:1"],
+            capture_output=True, timeout=30,
+        )
+        return p.stdout or None
+    except Exception:
+        return None
 
+
+def test_audio_info_music():
+    from handlers.commands.quote import _audio_info
+    AudioAttr = type("DocumentAttributeAudio", (), {})()
+    AudioAttr.duration = 200
+    AudioAttr.title = "Track"
+    AudioAttr.performer = "Band"
+    doc = SimpleNamespace(mime_type="audio/mpeg", attributes=[AudioAttr], size=1000)
+    reply = SimpleNamespace(voice=None, audio=None, document=doc)
+    is_audio, dur, label = _audio_info(reply)
+    assert is_audio and dur == 200
+    assert label == "🎵 Band — Track"
+    assert _audio_info(SimpleNamespace(voice=None, audio=None, document=None)) == (False, None, "")
+
+
+def test_image_audio_to_video_bytes():
+    from utils.gif_converter import is_ffmpeg_available, image_audio_to_video_bytes
+    if not is_ffmpeg_available():
+        import pytest
+        pytest.skip("no ffmpeg")
+    tone = _sine_m4a()
+    assert tone
+    card = render_quote_png(body="hi", sender_name="N", sender_id=1)
+    out = asyncio.run(image_audio_to_video_bytes(card, tone))
+    assert out is not None and len(out) > 1000
+    assert b"ftyp" in out[:32]
+
+
+def test_quote_with_voice_attaches_voice():
+    # Войс уходит ОДНИМ видео (карточка + звук внутри), без отдельного файла.
+    from handlers.commands.quote import handle
+    from utils.gif_converter import is_ffmpeg_available
+    if not is_ffmpeg_available():
+        import pytest
+        pytest.skip("no ffmpeg")
+
+    tone = _sine_m4a()
+    assert tone
     sent_files = []
     deleted = []
 
@@ -205,16 +255,18 @@ def test_quote_with_voice_attaches_voice():
         gif = None
         document = None
         sticker = None
+        audio = None
         voice = VoiceDoc()
         date = None
         fwd_from = None
+        entities = None
 
         async def get_sender(self):
             return SimpleNamespace(id=42, username="vova", first_name="Вова",
                                    last_name="Петров", deleted=False)
 
         async def download_media(self, file=None):
-            return b"voice-bytes"
+            return tone
 
     class Client:
         async def __call__(self, *args, **kwargs):
@@ -241,13 +293,82 @@ def test_quote_with_voice_attaches_voice():
             deleted.append(True)
 
     asyncio.run(handle("u-voice", Event()))
-    assert len(sent_files) == 2, sent_files
-    png_file, png_kw = sent_files[0]
-    voice_file, voice_kw = sent_files[1]
-    assert "caption" not in png_kw  # цитата — только фотка, без текста
-    assert voice_kw.get("voice_note") is True
-    assert voice_kw.get("reply_to") == 777
+    assert len(sent_files) == 1, [k for _, k in sent_files]
+    video_file, video_kw = sent_files[0]
+    assert getattr(video_file, "name", "") == "quote.mp4"
+    attrs = video_kw.get("attributes") or []
+    assert attrs and attrs[0].__class__.__name__ == "DocumentAttributeVideo"
+    assert "caption" not in video_kw
     assert deleted == [True]
+
+
+def test_quote_audio_with_caption_single_video():
+    # Звук + текст: подпись на карточке, звук внутри видео. Один файл.
+    from handlers.commands.quote import handle
+    from utils.gif_converter import is_ffmpeg_available
+    if not is_ffmpeg_available():
+        import pytest
+        pytest.skip("no ffmpeg")
+
+    tone = _sine_m4a()
+    assert tone
+    sent_files = []
+
+    AudioAttr = type("DocumentAttributeAudio", (), {})()
+    AudioAttr.duration = 3
+    AudioAttr.title = None
+    AudioAttr.performer = None
+
+    class Reply:
+        raw_text = None
+        message = None
+        caption = "любимый трек"
+        photo = None
+        video = None
+        video_note = None
+        animation = None
+        gif = None
+        document = SimpleNamespace(mime_type="audio/mpeg", attributes=[AudioAttr], size=9999)
+        sticker = None
+        audio = True
+        voice = None
+        date = None
+        fwd_from = None
+        entities = None
+
+        async def get_sender(self):
+            return SimpleNamespace(id=7, username=None, first_name="A",
+                                   last_name=None, deleted=False)
+
+        async def download_media(self, file=None):
+            return tone
+
+    class Client:
+        async def __call__(self, *args, **kwargs):
+            raise RuntimeError("no mtproto")
+
+        async def send_file(self, chat_id, file, **kwargs):
+            sent_files.append((file, kwargs))
+            return SimpleNamespace(id=888)
+
+    class Event:
+        chat_id = -100
+        id = 5
+        message = None
+        client = Client()
+
+        async def get_reply_message(self):
+            return Reply()
+
+        async def edit(self, text, **kwargs):
+            pass
+
+        async def delete(self):
+            pass
+
+    asyncio.run(handle("u-audio", Event()))
+    assert len(sent_files) == 1
+    assert getattr(sent_files[0][0], "name", "") == "quote.mp4"
 
 
 def test_emoji_kept_and_rendered():

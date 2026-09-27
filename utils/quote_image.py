@@ -169,10 +169,14 @@ _EMOJI_RUN_RE = re.compile(
     "\u2600-\u26FF"
     "\u2700-\u27BF"
     "\u2300-\u23FF"
+    "\u2190-\u21FF"
+    "\u25A0-\u25FF"
+    "\u2B00-\u2BFF"
     "\u20E3"
     "\u200d"
     "\ufe0f"
-    "]+",
+    "]+"
+    "|[0-9#*]\ufe0f?\u20E3",
     flags=re.UNICODE,
 )
 _emoji_base = None
