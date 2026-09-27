@@ -244,8 +244,7 @@ def test_quote_with_voice_attaches_voice():
     assert len(sent_files) == 2, sent_files
     png_file, png_kw = sent_files[0]
     voice_file, voice_kw = sent_files[1]
-    assert png_kw.get("caption") and "Вова" in png_kw["caption"] and "Петров" in png_kw["caption"]
-    assert "<code>42</code>" in png_kw["caption"]  # username резолвится только через MTProto
+    assert "caption" not in png_kw  # цитата — только фотка, без текста
     assert voice_kw.get("voice_note") is True
     assert voice_kw.get("reply_to") == 777
     assert deleted == [True]
@@ -351,3 +350,74 @@ def test_sticker_reply_becomes_photo_quote():
     assert len(sent_files) == 1
     assert not ev.edits or "Цитировать нечего" not in ev.edits[0]
     assert ev.deleted == [True]
+
+
+def test_math_unicode_glyphs_covered():
+    from utils.quote_image import _font_for, _font_has_glyph, BODY_FONT_SIZE
+    f = _font_for("𝒍", BODY_FONT_SIZE, False)
+    assert f is not None
+    assert _font_has_glyph(f, "𝒍")
+    assert _font_has_glyph(_font_for("A", BODY_FONT_SIZE, False), "A")
+    assert _font_has_glyph(_font_for("Ж", BODY_FONT_SIZE, False), "Ж")
+
+
+def test_math_name_card_renders():
+    out = render_quote_png(body="обычный текст", sender_name="𝒍𝒆𝒗𝒆𝒍𝒔",
+                           sender_id=8002855167, usernames=["lv0xn"],
+                           timestamp="2026-09-27 16:02")
+    assert out is not None and len(out) > 5000
+
+
+def test_quote_sent_without_caption():
+    from handlers.commands.quote import handle
+
+    sent_kwargs = []
+
+    class Reply:
+        raw_text = "привет"
+        message = "привет"
+        caption = None
+        photo = None
+        video = None
+        video_note = None
+        animation = None
+        gif = None
+        document = None
+        sticker = None
+        voice = None
+        date = None
+        fwd_from = None
+
+        async def get_sender(self):
+            return SimpleNamespace(id=1, username="u", first_name="N",
+                                   last_name=None, deleted=False)
+
+        async def download_media(self, file=None):
+            raise RuntimeError("no media")
+
+    class Client:
+        async def __call__(self, *args, **kwargs):
+            raise RuntimeError("no mtproto")
+
+        async def send_file(self, chat_id, file, **kwargs):
+            sent_kwargs.append(kwargs)
+            return SimpleNamespace(id=777)
+
+    class Event:
+        chat_id = -100
+        id = 3
+        message = None
+        client = Client()
+
+        async def get_reply_message(self):
+            return Reply()
+
+        async def edit(self, text, **kwargs):
+            pass
+
+        async def delete(self):
+            pass
+
+    asyncio.run(handle("u-nocap", Event()))
+    assert len(sent_kwargs) == 1
+    assert "caption" not in sent_kwargs[0]
