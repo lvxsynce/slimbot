@@ -263,8 +263,9 @@ async def handle(user_id: str, event) -> None:
     ]
     fallback_html = command_card("Quote", "\n".join(fallback_lines))
 
-    # ---- Caption: имя + фамилия + ID + username + дата (требование .q) ----
-    caption = _build_caption(sender_first, sender_last, sender_name, sender_id, usernames_list, date_str)
+    # ---- Без caption: вся информация уже в картинке (имя/ID/username/дата
+    # в шапке). Цитата уходит только фоткой, без текста под ней. ----
+    # _build_caption оставлен для совместимости (тесты), но не используется.
 
     # ---- Классификация media реплая: фон (фото) / GIF-путь (видео, incl. кружки) / войс ----
     background_bytes: bytes | None = None
@@ -312,7 +313,6 @@ async def handle(user_id: str, event) -> None:
                     await event.client.send_file(
                         event.chat_id,
                         file=buf,
-                        caption=caption,
                         reply_to=telethon_reply_to(event),
                         force_document=False,
                         attributes=[DocumentAttributeAnimated()],
@@ -341,7 +341,6 @@ async def handle(user_id: str, event) -> None:
             quote_msg = await event.client.send_file(
                 event.chat_id,
                 file=buf,
-                caption=caption,
                 reply_to=telethon_reply_to(event),
                 force_document=False,
             )

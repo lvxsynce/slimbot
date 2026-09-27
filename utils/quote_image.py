@@ -253,6 +253,90 @@ def _resolve_font(size: int, text: str = ""):
         return None
 
 
+# ===== Per-character font fallback (unicode coverage) =====
+# Один шрифт не покрывает весь Unicode: математические alphanumeric
+# (U+1D400–U+1D7FF, напр. 𝒍𝒆𝒗𝒆𝒍𝒔), символы, CJK — у каждого свой файл.
+# Поэтому текст рисуем ПОСИМВОЛЬНО: для каждого char берём первый шрифт
+# из цепочки, у которого есть настоящий глиф (а не .notdef-заглушка).
+_CHAIN_REGULAR_PATHS = (
+    Path("/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+)
+_CHAIN_BOLD_PATHS = (
+    Path("/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf"),
+    # Bold-варианта math-шрифта нет — regular сойдёт для фолбэка.
+    Path("/usr/share/fonts/truetype/noto/NotoSansMath-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansSymbols2-Regular.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansSymbols-Regular.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+)
+_chain_cache: dict = {}
+_glyph_cache: dict = {}
+_missing_sig_cache: dict = {}
+
+
+def _chain_fonts(size: int, bold: bool):
+    """Ordered font chain для (size, bold). Cached. Пустым не бывает."""
+    key = (size, bold)
+    if key not in _chain_cache:
+        from PIL import ImageFont
+        fonts = []
+        for p in (_CHAIN_BOLD_PATHS if bold else _CHAIN_REGULAR_PATHS):
+            if p.exists():
+                try:
+                    fonts.append(ImageFont.truetype(str(p), size=size))
+                except Exception:
+                    continue
+        if not fonts:
+            try:
+                fonts.append(ImageFont.load_default())
+            except Exception:
+                pass
+        _chain_cache[key] = fonts
+    return _chain_cache[key]
+
+
+def _missing_sig(font):
+    """Сигнатура .notdef-заглушки шрифта (size + bbox маски U+10FFFF)."""
+    fid = id(font)
+    if fid not in _missing_sig_cache:
+        try:
+            m = font.getmask("\U0010FFFF")
+            _missing_sig_cache[fid] = (m.size, m.getbbox())
+        except Exception:
+            _missing_sig_cache[fid] = None
+    return _missing_sig_cache[fid]
+
+
+def _font_has_glyph(font, ch: str) -> bool:
+    """True если у шрифта настоящий глиф (не tofu). Cached по (font, ch)."""
+    key = (id(font), ch)
+    hit = _glyph_cache.get(key)
+    if hit is None:
+        try:
+            m = font.getmask(ch)
+            sig = (m.size, m.getbbox())
+            hit = m.getbbox() is not None and sig != _missing_sig(font)
+        except Exception:
+            hit = False
+        _glyph_cache[key] = hit
+    return hit
+
+
+def _font_for(ch: str, size: int, bold: bool):
+    """Первый шрифт из цепочки с настоящим глифом. Fallback — базовый."""
+    for f in _chain_fonts(size, bold):
+        if _font_has_glyph(f, ch):
+            return f
+    fonts = _chain_fonts(size, bold)
+    return fonts[0] if fonts else None
+
+
 def _strip_html(text: str) -> str:
     """Strip HTML + unescape + collapse repeated spaces.
 
@@ -330,15 +414,18 @@ def _emoji_glyph(ch: str, px: int):
     return out
 
 
-def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int) -> float:
-    """Ширина строки с учётом emoji-глифов (для wrap'а)."""
+def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int, bold: bool = False) -> float:
+    """Ширина строки: текст — посимвольно через font-fallback chain, emoji — глифы."""
+    size = getattr(font, "size", emoji_px) or emoji_px
     total = 0.0
     for kind, chunk in runs:
         if kind == "t":
-            try:
-                total += font.getlength(chunk)
-            except Exception:
-                total += len(chunk) * 8
+            for ch in chunk:
+                f = _font_for(ch, size, bold) or font
+                try:
+                    total += f.getlength(ch)
+                except Exception:
+                    total += 8
         else:
             for ch in chunk:
                 g = _emoji_glyph(ch, emoji_px)
@@ -347,20 +434,23 @@ def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int) -> float:
     return total
 
 
-def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fill) -> float:
-    """Рисует строку runs (текст + цветные emoji). Возвращает x конца.
+def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fill, bold: bool = False) -> float:
+    """Рисует строку: текст — посимвольно (font-fallback) + цветные emoji.
 
-    Baseline: глифы вписываются в высоту строки (emoji_px ≈ размер шрифта).
+    Возвращает x конца. Baseline: глифы вписываются в высоту строки
+    (emoji_px ≈ размер шрифта).
     """
+    size = getattr(font, "size", emoji_px) or emoji_px
     cx = x
     for kind, chunk in _segment_runs(text):
         if kind == "t":
-            if chunk:
-                draw.text((cx, y), chunk, fill=fill, font=font)
+            for ch in chunk:
+                f = _font_for(ch, size, bold) or font
+                draw.text((cx, y), ch, fill=fill, font=f)
                 try:
-                    cx += font.getlength(chunk)
+                    cx += f.getlength(ch)
                 except Exception:
-                    cx += len(chunk) * 8
+                    cx += 8
         else:
             for ch in chunk:
                 g = _emoji_glyph(ch, emoji_px)
@@ -375,25 +465,20 @@ def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fi
     return cx
 
 
-def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None) -> list[str]:
+def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bold: bool = False) -> list[str]:
     """Word-wrap text → list of strings длиной до max_width pixels.
 
     Слова длиннее max_width бьются посимвольно — иначе строка
-    уезжает за canvas. При emoji_px замер идёт через runs (текст +
-    цветные глифы), иначе классический font.getlength.
+    уезжает за canvas. Замер всегда через runs (посимвольный
+    font-fallback + цветные глифы), emoji_px нужен для высоты глифов.
     """
     if not text:
         return []
 
-    use_runs = emoji_px is not None and _emoji_base_font() is not None
+    px = emoji_px if emoji_px is not None else (getattr(font, "size", 24) or 24)
 
     def _measure(s: str) -> float:
-        if use_runs:
-            return _runs_width(_segment_runs(s), font, emoji_px)
-        try:
-            return font.getlength(s)
-        except Exception:
-            return len(s) * 8
+        return _runs_width(_segment_runs(s), font, px, bold)
 
     def _break_long(word: str) -> list[str]:
         parts, cur = [], ""
@@ -594,7 +679,7 @@ def render_quote_png(
 
     name_y = PADDING_Y + (header_height - header_text_height) // 2
     draw = ImageDraw.Draw(img)
-    _draw_runs(draw, img, text_x, name_y, sender_name_text, name_font, NAME_FONT_SIZE, NAME_COLOR)
+    _draw_runs(draw, img, text_x, name_y, sender_name_text, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
     if info_str:
         info_y = name_y + NAME_LINE_HEIGHT + 2
         _draw_runs(draw, img, text_x, info_y, info_str, info_font, INFO_FONT_SIZE, INFO_COLOR)
