@@ -421,3 +421,71 @@ def test_quote_sent_without_caption():
     asyncio.run(handle("u-nocap", Event()))
     assert len(sent_kwargs) == 1
     assert "caption" not in sent_kwargs[0]
+
+
+def test_two_column_photo_right_text_quoted():
+    from utils.quote_image import LEFT_COL_W, COLUMN_GAP, PADDING_X
+    out = render_quote_png(body="привет мир", sender_name="Иван",
+                           sender_id=9, usernames=["ivan"], timestamp="t",
+                           background_bytes=_png_bytes((20, 120, 200)))
+    assert out is not None
+    from PIL import Image
+    im = Image.open(io.BytesIO(out)).convert("RGB")
+    assert im.size[0] == 1400
+    # Левая колонка темнее фона bubble: справа есть бокс (фото + текст).
+    left_px = im.getpixel((PADDING_X + 10, 130))
+    right_x0 = PADDING_X + LEFT_COL_W + COLUMN_GAP
+    right_px = im.getpixel((right_x0 + 60, 130))
+    assert left_px != right_px  # разные зоны: инфо слева, контент справа
+
+
+def test_body_wrapped_in_quotes():
+    import utils.quote_image as qi
+    seen = []
+    orig = qi._draw_runs
+    def spy(draw, img, x, y, text, font, emoji_px, fill, bold=False):
+        seen.append(text)
+        return orig(draw, img, x, y, text, font, emoji_px, fill, bold=bold)
+    qi._draw_runs = spy
+    try:
+        render_quote_png(body="hello", sender_name="N", sender_id=1)
+    finally:
+        qi._draw_runs = orig
+    assert seen and seen[0].startswith("«") is False  # имя без кавычек
+    assert any("«" in s and "»" in s for s in seen)  # тело в кавычках
+
+
+def test_info_strip_renders():
+    from utils.quote_image import render_info_strip_png, STRIP_WIDTH
+    out = render_info_strip_png(sender_name="Иван", sender_id=9,
+                                usernames=["ivan"], timestamp="t",
+                                body="подпись к видео")
+    assert out is not None and len(out) > 2000
+    from PIL import Image
+    im = Image.open(io.BytesIO(out))
+    assert im.size[0] == STRIP_WIDTH
+    assert im.size[1] >= 320
+
+
+def test_gif_direct_path_no_ffmpeg_needed():
+    # Реплай-гифка обязана стать анимированной цитатой БЕЗ ffmpeg —
+    # это регрессия «пустой цитаты».
+    from utils.quote_image import render_info_strip_png, _stack_gif_side_by_side
+    strip = render_info_strip_png(sender_name="N", sender_id=1, body="hi")
+    assert strip
+    out = _stack_gif_side_by_side(_two_frame_gif(), strip, max_frames=10)
+    assert out is not None
+    from PIL import Image, ImageSequence
+    gif = Image.open(io.BytesIO(out))
+    assert sum(1 for _ in ImageSequence.Iterator(gif)) == 2
+    assert gif.size[0] > 320  # плашка слева + кадры справа
+
+
+def test_render_video_gif_from_reply_gif():
+    # Сквозной: bytes настоящей гифки → анимированный результат.
+    from utils.quote_image import render_info_strip_png
+    strip = render_info_strip_png(sender_name="N", sender_id=1)
+    out = asyncio.run(render_video_quote_gif(_two_frame_gif(), card_png_bytes=strip))
+    assert out is not None
+    from PIL import Image, ImageSequence
+    assert sum(1 for _ in ImageSequence.Iterator(Image.open(io.BytesIO(out)))) == 2

@@ -76,6 +76,13 @@ MAX_HEIGHT = 2400
 # шрифтов не меняются.
 VERTICAL_SCALE = 2.5
 
+# Two-column layout: слева инфо-колонка, справа контент-бокс.
+LEFT_COL_W = 460
+LEFT_COL_PAD = 16
+COLUMN_GAP = 40
+PHOTO_MAX_H = 1000   # кап высоты фото в правой колонке
+STRIP_WIDTH = 440    # ширина info-strip для GIF-цитат
+
 # ===== Colors =====
 # Solid RGB background (canvas)
 BG_COLOR = (32, 33, 38)
@@ -597,15 +604,15 @@ def render_quote_png(
         PNG bytes (RGB, не RGBA — для universal preview в Telegram).
         ``None`` если Pillow/fonts недоступны.
 
-    Layout (прямоугольный):
+    Layout (две колонки):
         ┌─────────────────────────────────┐
-        │ [avatar]  Sender Name           │
-        │            ID: 123 · @u · t    │
-        │   ┌─────────────────────────┐   │
-        │   │  body text...           │   │  ← полупрозрачный bubble
-        │   │  more body text...      │   │
-        │   └─────────────────────────┘   │
+        │ [avatar]  │ ┌─────────────────┐ │
+        │ Sender    │ │ «body text...»  │ │  ← контент-бокс справа
+        │ ID: 123   │ │ more text...»   │ │    (фото + текст в кавычках)
+        │ @user · t │ └─────────────────┘ │
         └─────────────────────────────────┘
+      Слева вверху — вся информация (аватар, имя, ID, username, дата).
+      Справа — вложение (фото fit-вписанное) и/или текст в «кавычках».
     """
     if not is_available():
         return None
@@ -646,7 +653,7 @@ def render_quote_png(
         if body_lines:
             body_lines[-1] = body_lines[-1].rstrip() + "…"
 
-    # --- Высота canvas (вертикаль × VERTICAL_SCALE, текст центрируем в строках) ---
+    # --- Вертикальный масштаб ---
     _pad_y = int(PADDING_Y * VERTICAL_SCALE)
     _name_lh = int(NAME_LINE_HEIGHT * VERTICAL_SCALE)
     _info_lh = int(INFO_LINE_HEIGHT * VERTICAL_SCALE)
@@ -655,75 +662,117 @@ def render_quote_png(
     _bub_pad_y = int(BUBBLE_TEXT_PAD_Y * VERTICAL_SCALE)
     _min_h = int(MIN_HEIGHT * VERTICAL_SCALE)
     _max_h = int(MAX_HEIGHT * VERTICAL_SCALE)
-    header_text_height = _name_lh + _info_lh + 6
-    header_height = max(AVATAR_SIZE, header_text_height)
-    if body_lines:
-        body_block_h = len(body_lines) * _body_lh
-        bubble_height = body_block_h + 2 * _bub_pad_y
-        total_height = (
-            _pad_y + header_height
-            + _gap
-            + bubble_height
-            + _pad_y
+
+    # --- Левая колонка: avatar + имя + ID + username + дата ---
+    left_text_w = LEFT_COL_W - 2 * LEFT_COL_PAD
+    name_lines = (
+        _wrap_text(sender_name_text, name_font, max_width=left_text_w,
+                   emoji_px=NAME_FONT_SIZE, bold=True)
+        or [sender_name_text]
+    )
+    info_items: list[str] = []
+    if sender_id:
+        info_items.append(f"ID: {sender_id}")
+    for u in unames:
+        info_items.append(f"@{u}")
+    if timestamp_text:
+        info_items.append(timestamp_text)
+    info_lines: list[str] = []
+    for item in info_items:
+        info_lines.extend(
+            _wrap_text(item, info_font, max_width=left_text_w,
+                       emoji_px=INFO_FONT_SIZE) or [item]
         )
-    else:
-        # Медиа-цитата без текста: только header.
-        total_height = _pad_y + header_height + _pad_y
-    total_height = min(_max_h, max(_min_h, total_height))
+    left_h = 0
+    if avatar_img is not None:
+        left_h += AVATAR_SIZE + _gap // 2
+    left_h += len(name_lines) * _name_lh + _gap // 2 + len(info_lines) * _info_lh
+
+    # --- Правая колонка: фото (вложение) + текст в «кавычках» ---
+    right_x = PADDING_X + LEFT_COL_W + COLUMN_GAP
+    right_w = WIDTH - PADDING_X - right_x
+    right_text_w = right_w - 2 * BUBBLE_TEXT_PAD_X
+    quoted = f"«{body_text}»" if body_text else ""
+    body_lines = _wrap_text(quoted, body_font, max_width=right_text_w,
+                            emoji_px=BODY_FONT_SIZE)
+    if len(body_lines) > MAX_BODY_LINES:
+        body_lines = body_lines[:MAX_BODY_LINES]
+        if body_lines:
+            body_lines[-1] = body_lines[-1].rstrip() + "…»"
+    photo_img = None
+    if background_bytes:
+        try:
+            from PIL import Image
+            ph = Image.open(io.BytesIO(background_bytes)).convert("RGB")
+            scale = min(right_text_w / max(ph.width, 1), PHOTO_MAX_H / max(ph.height, 1))
+            scale = min(max(scale, 0.05), 3.0)
+            photo_img = ph.resize((max(1, int(ph.width * scale)), max(1, int(ph.height * scale))))
+        except Exception:
+            photo_img = None
+    right_h = 0
+    if photo_img is not None or body_lines:
+        if photo_img is not None:
+            right_h += photo_img.height
+            if body_lines:
+                right_h += _gap // 2
+        right_h += len(body_lines) * _body_lh
+        right_h += 2 * _bub_pad_y
+
+    content_h = max(left_h, right_h)
+    total_height = min(_max_h, max(_min_h, 2 * _pad_y + content_h))
 
     # --- Canvas: RGB (universal preview) ---
     img = Image.new("RGB", (WIDTH, total_height), color=BG_COLOR)
-    if background_bytes:
-        try:
-            img = _apply_background(img, background_bytes)
-        except Exception:
-            pass
 
-    # --- Header: avatar + name + info ---
-    avatar_x = PADDING_X
-    avatar_y = _pad_y + (header_height - AVATAR_SIZE) // 2 if avatar_img else _pad_y
-    text_x = PADDING_X
+    # --- Левая колонка ---
+    draw = ImageDraw.Draw(img)
+    lx = PADDING_X + LEFT_COL_PAD
+    ly = _pad_y
     if avatar_img is not None:
         try:
-            img.paste(avatar_img, (avatar_x, avatar_y), mask=avatar_img.split()[3])
+            img.paste(avatar_img, (lx, ly), mask=avatar_img.split()[3])
         except Exception:
-            img.paste(avatar_img.convert("RGB"), (avatar_x, avatar_y))
-        text_x = avatar_x + AVATAR_SIZE + 20
+            img.paste(avatar_img.convert("RGB"), (lx, ly))
+        ly += AVATAR_SIZE + _gap // 2
+    for line in name_lines:
+        _draw_runs(draw, img, lx, ly + (_name_lh - NAME_FONT_SIZE) // 2,
+                   line, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
+        ly += _name_lh
+    ly += _gap // 2
+    for line in info_lines:
+        _draw_runs(draw, img, lx, ly + (_info_lh - INFO_FONT_SIZE) // 2,
+                   line, info_font, INFO_FONT_SIZE, INFO_COLOR)
+        ly += _info_lh
 
-    name_y = _pad_y + (header_height - header_text_height) // 2
-    draw = ImageDraw.Draw(img)
-    # Центрируем глифы внутри (вытянутых) строк — иначе текст липнет к верху.
-    _draw_runs(draw, img, text_x, name_y + (_name_lh - NAME_FONT_SIZE) // 2,
-               sender_name_text, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
-    if info_str:
-        info_y = name_y + _name_lh + 2
-        _draw_runs(draw, img, text_x, info_y + (_info_lh - INFO_FONT_SIZE) // 2,
-                   info_str, info_font, INFO_FONT_SIZE, INFO_COLOR)
-
-    # --- Semi-transparent bubble overlay (RGBA) + body (только если есть текст) ---
-    if body_lines:
+    # --- Правый бокс: bubble + accent-bar + фото + текст ---
+    if right_h > 0:
         overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
         overlay_draw = ImageDraw.Draw(overlay)
-        bubble_y_top = _pad_y + header_height + _gap
-        bubble_box = (
-            PADDING_X + BUBBLE_INSET_X,
-            bubble_y_top,
-            WIDTH - PADDING_X - BUBBLE_INSET_X,
-            bubble_y_top + bubble_height,
-        )
-        overlay_draw.rounded_rectangle(
-            bubble_box, radius=16, fill=BUBBLE_COLOR,
+        bubble_box = (right_x, _pad_y, WIDTH - PADDING_X, _pad_y + right_h)
+        overlay_draw.rounded_rectangle(bubble_box, radius=16, fill=BUBBLE_COLOR)
+        # Accent-полоса слева — маркер цитаты.
+        overlay_draw.rectangle(
+            (right_x, _pad_y + 10, right_x + 6, _pad_y + right_h - 10),
+            fill=NAME_COLOR,
         )
         img.paste(overlay, (0, 0), mask=overlay)
-
-    # --- Body текст поверх bubble ---
-    if body_lines:
         draw = ImageDraw.Draw(img)
-        text_y = bubble_y_top + _bub_pad_y + (_body_lh - BODY_FONT_SIZE) // 2
-        text_x = PADDING_X + BUBBLE_INSET_X + BUBBLE_TEXT_PAD_X
+        cy = _pad_y + _bub_pad_y
+        if photo_img is not None:
+            px = right_x + (right_w - photo_img.width) // 2
+            img.paste(photo_img, (px, cy))
+            draw.rectangle(
+                (px, cy, px + photo_img.width, cy + photo_img.height),
+                outline=INFO_COLOR, width=2,
+            )
+            cy += photo_img.height
+            if body_lines:
+                cy += _gap // 2
+        tx = right_x + BUBBLE_TEXT_PAD_X
         for line in body_lines:
-            _draw_runs(draw, img, text_x, text_y, line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
-            text_y += _body_lh
+            _draw_runs(draw, img, tx, cy + (_body_lh - BODY_FONT_SIZE) // 2,
+                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
+            cy += _body_lh
 
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
@@ -731,6 +780,169 @@ def render_quote_png(
 
 
 MAX_QUOTE_GIF_BYTES = 12 * 1024 * 1024
+
+
+def render_info_strip_png(
+    *,
+    sender_name: str = "",
+    sender_id: int | None = None,
+    usernames: list[str] | None = None,
+    avatar_bytes: bytes | None = None,
+    timestamp: str = "",
+    body: str = "",
+    width: int = STRIP_WIDTH,
+) -> bytes | None:
+    """Узкая вертикальная info-плашка для GIF-цитат: слева от кадров.
+
+    Содержит avatar + имя + ID + username + дату + опциональный текст
+    (подпись к видео/гифке). Высоту подгоняет `_stack_gif_side_by_side`
+    под высоту видеокадра.
+    """
+    if not is_available():
+        return None
+
+    from PIL import Image, ImageDraw
+
+    sender_name_text = _strip_html(sender_name) or "(unknown)"
+    unames = (usernames or [])[:2]
+    timestamp_text = _strip_html(timestamp)
+    body_text = _strip_html(body)
+
+    name_font = _resolve_font(NAME_FONT_SIZE, sender_name_text)
+    info_font = _resolve_font(INFO_FONT_SIZE, "ID")
+    body_font = _resolve_font(BODY_FONT_SIZE, body_text)
+    if not (name_font and info_font and body_font):
+        return None
+
+    pad = 36
+    text_w = width - 2 * pad
+    gap = int(HEADER_TO_BUBBLE_GAP * VERTICAL_SCALE)
+    name_lh = int(NAME_LINE_HEIGHT * VERTICAL_SCALE)
+    info_lh = int(INFO_LINE_HEIGHT * VERTICAL_SCALE)
+    body_lh = int(BODY_LINE_HEIGHT * VERTICAL_SCALE)
+
+    avatar_img = _circle_avatar(avatar_bytes) if avatar_bytes else None
+
+    name_lines = (
+        _wrap_text(sender_name_text, name_font, max_width=text_w,
+                   emoji_px=NAME_FONT_SIZE, bold=True)
+        or [sender_name_text]
+    )
+    info_items: list[str] = []
+    if sender_id:
+        info_items.append(f"ID: {sender_id}")
+    for u in unames:
+        info_items.append(f"@{u}")
+    if timestamp_text:
+        info_items.append(timestamp_text)
+    info_lines: list[str] = []
+    for item in info_items:
+        info_lines.extend(
+            _wrap_text(item, info_font, max_width=text_w,
+                       emoji_px=INFO_FONT_SIZE) or [item]
+        )
+    quoted = f"«{body_text}»" if body_text else ""
+    body_lines = _wrap_text(quoted, body_font, max_width=text_w,
+                            emoji_px=BODY_FONT_SIZE)
+    if len(body_lines) > MAX_BODY_LINES:
+        body_lines = body_lines[:MAX_BODY_LINES]
+        if body_lines:
+            body_lines[-1] = body_lines[-1].rstrip() + "…»"
+
+    h = pad
+    if avatar_img is not None:
+        h += AVATAR_SIZE + gap // 2
+    h += len(name_lines) * name_lh + gap // 2 + len(info_lines) * info_lh
+    if body_lines:
+        h += gap // 2 + len(body_lines) * body_lh
+    h += pad
+
+    img = Image.new("RGB", (width, max(h, 320)), color=BG_COLOR)
+    draw = ImageDraw.Draw(img)
+    y = pad
+    if avatar_img is not None:
+        try:
+            img.paste(avatar_img, (pad, y), mask=avatar_img.split()[3])
+        except Exception:
+            img.paste(avatar_img.convert("RGB"), (pad, y))
+        y += AVATAR_SIZE + gap // 2
+    for line in name_lines:
+        _draw_runs(draw, img, pad, y + (name_lh - NAME_FONT_SIZE) // 2,
+                   line, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
+        y += name_lh
+    y += gap // 2
+    for line in info_lines:
+        _draw_runs(draw, img, pad, y + (info_lh - INFO_FONT_SIZE) // 2,
+                   line, info_font, INFO_FONT_SIZE, INFO_COLOR)
+        y += info_lh
+    if body_lines:
+        y += gap // 2
+        for line in body_lines:
+            _draw_runs(draw, img, pad, y + (body_lh - BODY_FONT_SIZE) // 2,
+                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
+            y += body_lh
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    return buf.getvalue()
+
+
+def _as_gif_direct(data: bytes) -> bytes | None:
+    """Если bytes уже GIF с ≥2 кадрами — вернуть как есть (без ffmpeg).
+
+    Это фиксит пустые GIF-цитаты: реплай-гифка раньше всегда гналась через
+    ffmpeg (которого на сервере не было) и путь молча падал в статичный PNG.
+    """
+    if not data:
+        return None
+    try:
+        from PIL import Image
+        gif = Image.open(io.BytesIO(data))
+        if (gif.format or "").upper() != "GIF":
+            return None
+        n = getattr(gif, "n_frames", 0) or 0
+        if n < 2:
+            try:
+                from PIL import ImageSequence
+                n = sum(1 for _ in ImageSequence.Iterator(gif))
+            except Exception:
+                return None
+        return data if n >= 2 else None
+    except Exception:
+        return None
+
+
+def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 30) -> bytes | None:
+    """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами."""
+    from PIL import Image, ImageSequence
+
+    gif = Image.open(io.BytesIO(gif_bytes))
+    strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
+    frames: list = []
+    durations: list[int] = []
+    for i, frame in enumerate(ImageSequence.Iterator(gif)):
+        if i >= max_frames:
+            break
+        fr = frame.convert("RGB")
+        w, h = fr.size
+        strip_w = max(1, int(strip.width * h / max(strip.height, 1)))
+        strip_small = strip.resize((strip_w, h))
+        canvas = Image.new("RGB", (strip_w + w, h), color=(0, 0, 0))
+        canvas.paste(strip_small, (0, 0))
+        canvas.paste(fr, (strip_w, 0))
+        frames.append(canvas)
+        durations.append(int(frame.info.get("duration", 100)) or 100)
+    if len(frames) < 2:
+        return None
+    buf = io.BytesIO()
+    frames[0].save(
+        buf, format="GIF", save_all=True, append_images=frames[1:],
+        duration=durations, loop=0,
+    )
+    out = buf.getvalue()
+    if len(out) > MAX_QUOTE_GIF_BYTES:
+        return None
+    return out
 
 
 def _stack_gif_over_card(gif_bytes: bytes, card_png: bytes, max_frames: int = 30) -> bytes | None:
@@ -777,28 +989,33 @@ async def render_video_quote_gif(
     duration_s: float = 3.0,
     timeout_s: float = 60.0,
 ) -> bytes | None:
-    """Видео из реплая + карточка цитаты снизу → анимированная GIF.
+    """Видео/гифка из реплая справа + info-плашка слева → анимированная GIF.
 
-    Returns None если нет ffmpeg / encode упал / итог тяжелее лимита —
+    Если bytes уже GIF (реплай-гифка) — кадры берутся напрямую через Pillow
+    без ffmpeg. Видео (mp4/кружки) конвертируются через ffmpeg, если он есть.
+
+    Returns None если нет кадров / encode упал / итог тяжелее лимита —
     caller падает на статичную PNG-цитату.
     """
     if not video_bytes or not card_png_bytes:
         return None
-    try:
-        from utils.gif_converter import video_to_gif_bytes
-        gif = await video_to_gif_bytes(
-            video_bytes,
-            max_duration_s=duration_s,
-            max_fps=fps,
-            max_width=max_width,
-            timeout_s=timeout_s,
-        )
-    except Exception:
-        return None
+    gif = _as_gif_direct(video_bytes)
+    if gif is None:
+        try:
+            from utils.gif_converter import video_to_gif_bytes
+            gif = await video_to_gif_bytes(
+                video_bytes,
+                max_duration_s=duration_s,
+                max_fps=fps,
+                max_width=max_width,
+                timeout_s=timeout_s,
+            )
+        except Exception:
+            return None
     if not gif:
         return None
     try:
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, _stack_gif_over_card, gif, card_png_bytes, max_frames)
+        return await loop.run_in_executor(None, _stack_gif_side_by_side, gif, card_png_bytes, max_frames)
     except Exception:
         return None
