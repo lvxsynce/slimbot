@@ -29,6 +29,7 @@ Fonts:
 
 from __future__ import annotations
 
+import asyncio
 import html as _html
 import io
 import logging
@@ -301,6 +302,28 @@ def _circle_avatar(avatar_bytes: bytes):
 
 # ===== Main entry point v2 =====
 
+def _apply_background(img, bg_bytes: bytes):
+    """Фото из реплая как фон: cover-fit + blur + затемнение.
+
+    Pure (Pillow only) — покрыта тестами. Возвращает новый RGB Image
+    того же размера. Бросает исключение при битых байтах (caller ловит).
+    """
+    from PIL import Image, ImageFilter
+
+    bg = Image.open(io.BytesIO(bg_bytes)).convert("RGB")
+    w, h = img.size
+    # cover-fit: масштабируем чтобы покрыть canvas, лишнее режем по центру
+    scale = max(w / max(bg.width, 1), h / max(bg.height, 1))
+    bg = bg.resize((max(1, int(bg.width * scale)), max(1, int(bg.height * scale))))
+    left = (bg.width - w) // 2
+    top = (bg.height - h) // 2
+    bg = bg.crop((left, top, left + w, top + h))
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=12))
+    # затемнение чтобы белый текст читался
+    dark = Image.new("RGB", (w, h), color=(0, 0, 0))
+    return Image.blend(bg, dark, alpha=0.55)
+
+
 def render_quote_png(
     *,
     body: str,
@@ -309,6 +332,7 @@ def render_quote_png(
     usernames: list[str] | None = None,
     avatar_bytes: bytes | None = None,
     timestamp: str = "",
+    background_bytes: bytes | None = None,
 ) -> bytes | None:
     """Render прямоугольной PNG-цитаты с avatar + bubble overlay.
 
@@ -319,6 +343,8 @@ def render_quote_png(
         usernames: Список @username (cap 2 в layout). None или [] → нет.
         avatar_bytes: PNG/JPEG bytes аватарки. None → без аварки.
         timestamp: Строка даты (например, "2026-07-18 18:30") для info-блока.
+        background_bytes: Фото из replied сообщения — используется как фон
+            (cover-fit + blur + затемнение) вместо плоской заливки.
 
     Returns:
         PNG bytes (RGB, не RGBA — для universal preview в Telegram).
@@ -391,6 +417,11 @@ def render_quote_png(
 
     # --- Canvas: RGB (universal preview) ---
     img = Image.new("RGB", (WIDTH, total_height), color=BG_COLOR)
+    if background_bytes:
+        try:
+            img = _apply_background(img, background_bytes)
+        except Exception:
+            pass
 
     # --- Header: avatar + name + info ---
     avatar_x = PADDING_X
@@ -451,3 +482,77 @@ def render_quote_png(
     buf = io.BytesIO()
     img.save(buf, format="PNG", optimize=True)
     return buf.getvalue()
+
+
+MAX_QUOTE_GIF_BYTES = 12 * 1024 * 1024
+
+
+def _stack_gif_over_card(gif_bytes: bytes, card_png: bytes, max_frames: int = 30) -> bytes | None:
+    """Кадры GIF + статичная карточка цитаты снизу. Pure (Pillow) — покрыто тестами."""
+    from PIL import Image, ImageSequence
+
+    gif = Image.open(io.BytesIO(gif_bytes))
+    card = Image.open(io.BytesIO(card_png)).convert("RGB")
+    frames: list = []
+    durations: list[int] = []
+    for i, frame in enumerate(ImageSequence.Iterator(gif)):
+        if i >= max_frames:
+            break
+        fr = frame.convert("RGB")
+        w, h = fr.size
+        card_h = max(1, int(card.height * w / max(card.width, 1)))
+        card_small = card.resize((w, card_h))
+        canvas = Image.new("RGB", (w, h + card_h), color=(0, 0, 0))
+        canvas.paste(fr, (0, 0))
+        canvas.paste(card_small, (0, h))
+        frames.append(canvas)
+        durations.append(int(frame.info.get("duration", 100)) or 100)
+    if len(frames) < 2:
+        # Один кадр — не анимация, такой «GIF» бесполезен.
+        return None
+    buf = io.BytesIO()
+    frames[0].save(
+        buf, format="GIF", save_all=True, append_images=frames[1:],
+        duration=durations, loop=0,
+    )
+    out = buf.getvalue()
+    if len(out) > MAX_QUOTE_GIF_BYTES:
+        return None
+    return out
+
+
+async def render_video_quote_gif(
+    video_bytes: bytes,
+    *,
+    card_png_bytes: bytes,
+    max_width: int = 640,
+    max_frames: int = 30,
+    fps: int = 10,
+    duration_s: float = 3.0,
+    timeout_s: float = 60.0,
+) -> bytes | None:
+    """Видео из реплая + карточка цитаты снизу → анимированная GIF.
+
+    Returns None если нет ffmpeg / encode упал / итог тяжелее лимита —
+    caller падает на статичную PNG-цитату.
+    """
+    if not video_bytes or not card_png_bytes:
+        return None
+    try:
+        from utils.gif_converter import video_to_gif_bytes
+        gif = await video_to_gif_bytes(
+            video_bytes,
+            max_duration_s=duration_s,
+            max_fps=fps,
+            max_width=max_width,
+            timeout_s=timeout_s,
+        )
+    except Exception:
+        return None
+    if not gif:
+        return None
+    try:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(None, _stack_gif_over_card, gif, card_png_bytes, max_frames)
+    except Exception:
+        return None

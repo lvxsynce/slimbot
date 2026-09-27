@@ -162,9 +162,11 @@ HELPS: dict[str, dict[str, str]] = {
                 "Можно реплаем на сообщение.",
     },
     "quote": {
-        "syntax": ".quote  |  .цитата",
+        "syntax": ".quote  |  .цитата  |  .q  |  .цит",
         "desc": "Красиво оформить replied сообщение В ВИДЕ PNG-картинки (1200px): timestamp, sender, "
-                "текст, forward-info. Если Pillow/DejaVu Sans недоступны — graceful fallback на HTML blockquote. "
+                "текст, forward-info. Фон — фото из реплая (blur). Видео/кружки/GIF в реплае → анимированная "
+                "GIF-цитата. Голосовое в реплае → цитата + приложенный войс. "
+                "Подпись: имя, фамилия, ID, username. Если Pillow/DejaVu Sans недоступны — graceful fallback на HTML blockquote. "
                 "Только с Telethon-сессией.",
     },
     "vgf": {
@@ -212,7 +214,7 @@ _PAIRS = {
     "unpin": ["unpin", "открепить", "раскрепить", "откреп"],
     "invitelink": ["ссылка", "invitelink", "инвайт", "invite"],
     "coin": ["монетка", "coin", "монета", "орёл", "решка"],
-    "quote": ["quote", "цитата"],
+    "quote": ["quote", "цитата", "q", "цит"],
     "ai": ["ии", "ai"],
     "timezone": ["timezone", "таймзона", "tz"],
     "b64": ["b64", "base64"],
