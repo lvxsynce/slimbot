@@ -100,7 +100,7 @@ cmdhelp → dm → extra → help → id → love → ping → start
 | Значение | Назначение |
 |---|---|
 | `c1` | Начать подключение (ввод номера) |
-| `w1` | Показать объяснение «зачем это» |
+| `w1` | Показать объяснение «зачем это» (session-aware: с сессией — статус + «Выключить») |
 | `b1` | Вернуться к справке из объяснения |
 | `p:X` | Цифра для номера (`X` = `+` или `0`–`9`) |
 | `pb` | Бэкспейс для номера |
@@ -121,7 +121,7 @@ cmdhelp → dm → extra → help → id → love → ping → start
 |---|---|
 | `/start` | Статус Telethon-сессии + кнопки. Если сессия — показать `[x] Выключить`, иначе `[+] Включить`. |
 | `/help` | Справка по всем командам (`format_help(has_session)`). |
-| `/status` | Статус Telethon-сессии: «подключена» / «не подключена». |
+| `/status` | Богатая карточка: сессия, число отслеживаемых чатов, фото-режим, авто-перевод, ня-режим, аптайм. |
 | `/logout` | Кнопка подтверждения отзыва Telethon-сессии (см. callback'ы выше). |
 
 ---
@@ -425,11 +425,16 @@ Dot-команды работают в ДВУХ каналах:
 ```
 slimbot/
 ├── bot.py                  # Точка входа. aiogram Dispatcher + Telethon старт в on_startup.
+│                           #   Логи: stderr (WARNING) + bot.log с ротацией 10МБ×5 (utils/logging_setup.py).
 ├── config.py               # TOKEN, API_ID, API_HASH, BOT_NAME, пути (sessions/, temp/),
 │                           #   пути JSON (watch/sessions/photo/auto_tr/user_tz).
-│                           #   СЕКРЕТЫ В ОТКРЫТОМ ВИДЕ — желательно
-│                           #   вынести в .env (issue в AGENTS.md ниже).
-├── requirements.txt        # aiogram >=3, telethon, aiohttp, dnspython.
+│                           #   Секреты — только через .env (в репозитории пустые defaults).
+├── requirements.txt        # aiogram >=3, telethon, aiohttp, dnspython, dotenv, Pillow.
+├── Dockerfile              # python:3.12-slim + ffmpeg; состояние в /data (SLIMBOT_DATA_DIR).
+├── docker-compose.yml      # Сервис slimbot + named volume slimbot-data.
+├── .dockerignore           # Зеркалит .gitignore (без .env, сессий, состояния).
+├── README.md               # Быстрый старт.
+├── CHANGELOG.md            # История версий.
 ├── AGENTS.md               # Этот файл.
 │
 ├── watched_chats.json      # user_id → [[chat_id, thread_id]].
@@ -453,11 +458,12 @@ slimbot/
 │   ├── calc.py             # AST eval калькулятор.
 │   ├── hashing.py          # hash/uuid/b64.
 │   ├── linkcheck.py        # URL check + extract_url + risk-score.
-│   ├── netinfo.py          # DNS (dns.asyncresolver) + ipinfo + unshorten.
+│   ├── logging_setup.py    # RotatingFileHandler для bot.log (идемпотентный).
+│   ├── netinfo.py          # DNS (dns.asyncresolver, сверка у Cloudflare/Google/Quad9) + ipinfo + unshorten + http_probe + fetch_title.
 │   ├── suggest.py          # Левенштейн подсказка.
-│   ├── translate.py        # Google Translate (free, ponytail endpoint).
 │   ├── bot_info.py         # cfg.BOT_USERNAME динамические хелперы.
 │   └── timezones.py        # TZ presets + RU_ALIASES + canonicalize.
+│                           # (перевод — через ИИ: handlers/commands/tools.py::translate_with_ai, отдельного translate.py нет).
 │
 ├── handlers/
 │   ├── __init__.py         # Пустой.
@@ -478,7 +484,7 @@ slimbot/
 │       │                   #   HELP_WORDS, is_help_request, render. Подключён первым через cmdhelp.
 │       ├── cmdhelp.py      # `.cmd справка` / `.cmd help` / `.cmd ?` / `.cmd хелп` интерсептор.
 │       ├── extra.py        # `.me/.я`, `.chat/.чат`, `.who/.кто` (aiogram-путь; для Telethon — tlm).
-│       ├── help.py         # `/help`, `.help` + клавиатуры.
+│       ├── help.py         # `/help`, `.help` + клавиатуры (разделы База/Сессия/ИИ через helpsec:*).
 │       ├── ping.py         # `.ping`.
 │       ├── time.py         # `.time` (timezone-aware).
 │       ├── id.py           # `.id`.

@@ -34,3 +34,13 @@ python3 bot.py
 ```bash
 python3 -m pytest tests/ -q
 ```
+
+## Docker
+
+```bash
+docker compose up --build -d
+```
+
+Состояние (сессии, JSON, логи) живёт в volume `slimbot-data`
+(`SLIMBOT_DATA_DIR=/data`). Логи: `docker compose logs -f` + `bot.log`
+с ротацией 10МБ×5 внутри контейнера.

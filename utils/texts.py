@@ -161,21 +161,21 @@ class Text:
 # ============================================================
 
 
-async def render_for_user(user_id: int | str | None, text: Text, **values: Any) -> str:
+async def render_for_user(uid: int | str | None, text: Text, **values: Any) -> str:
     """Рендер ``Text`` с проверкой Premium через Telethon-сессию юзера.
 
     Подходит для:
-    - aiogram handlers: ``user_id`` = ``message.from_user.id`` в личке с ботом;
-    - Telethon handlers: ``user_id`` = ID текущего юзера.
+    - aiogram handlers: ``uid`` = ``message.from_user.id`` в личке с ботом;
+    - Telethon handlers: ``uid`` = ID текущего юзера.
 
-    Если ``user_id`` is None → premium=False (fallback на unicode).
+    Если ``uid`` is None → premium=False (fallback на unicode).
     """
-    if user_id is None:
+    if uid is None:
         return text.render(premium=False, **values)
     # Lazy import — premium.py импортирует telethon_manager, тот — bot, и т.д.
     from utils.premium import is_user_premium
 
-    premium = await is_user_premium(user_id)
+    premium = await is_user_premium(uid)
     return text.render(premium=premium, **values)
 
 

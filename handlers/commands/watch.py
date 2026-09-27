@@ -70,6 +70,18 @@ def _photo_note(uid: str) -> str:
     return Texts.Watch.PHOTO_NOTE_OFF.render(premium=False)
 
 
+def _first_watch_hint(user_id: str) -> str:
+    """Подсказка новичка: если это первый чат в списке — объяснить что дальше."""
+    if len(get_chats_for_user(user_id)) == 1:
+        return (
+            "\n\n[i] Первый чат в списке! Теперь отсюда будут сохраняться "
+            "одноразовые фото.\n"
+            "<code>.watched</code> — показать список, "
+            "<code>.unwatch</code> — убрать чат."
+        )
+    return ""
+
+
 async def handle_telethon(user_id: str, event, thread_id: int = 0):
     """Telethon-side .watch/.unwatch/.watched. premium-aware через ``render_for_user``."""
     from utils.escape import esc
@@ -97,7 +109,7 @@ async def handle_telethon(user_id: str, event, thread_id: int = 0):
                         user_id, Texts.Watch.WATCH_OK,
                         label=f"{esc(chat_title)} (весь чат)",
                         photo_note=_photo_note(user_id),
-                    )),
+                    ) + _first_watch_hint(user_id)),
                     parse_mode="html",
                 )
             else:
@@ -120,7 +132,7 @@ async def handle_telethon(user_id: str, event, thread_id: int = 0):
                         user_id, Texts.Watch.WATCH_OK,
                         label=esc(label),
                         photo_note=_photo_note(user_id),
-                    )),
+                    ) + _first_watch_hint(user_id)),
                     parse_mode="html",
                 )
             else:

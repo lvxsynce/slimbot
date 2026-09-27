@@ -5,13 +5,16 @@ from pathlib import Path
 from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 
-from config import TOKEN, BOT_NAME, SESSIONS_DIR, TEMP_DIR
+from config import TOKEN, BOT_NAME, SESSIONS_DIR, TEMP_DIR, DATA_DIR
 import config as cfg
 
 logging.basicConfig(level=logging.WARNING)
 logging.getLogger("aiogram.event").setLevel(logging.INFO)
 logging.getLogger("utils.telethon_manager").setLevel(logging.INFO)
 logging.getLogger("handlers.session").setLevel(logging.DEBUG)
+
+from utils.logging_setup import setup_file_logging
+setup_file_logging(DATA_DIR / "bot.log")
 
 bot = Bot(token=TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
 dp = Dispatcher()

@@ -1,0 +1,12 @@
+services:
+  slimbot:
+    build: .
+    env_file: .env
+    environment:
+      SLIMBOT_DATA_DIR: /data
+    volumes:
+      - slimbot-data:/data
+    restart: unless-stopped
+
+volumes:
+  slimbot-data:
