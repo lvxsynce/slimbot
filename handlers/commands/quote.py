@@ -139,7 +139,7 @@ async def _render_card_png(body_text, sender_name, sender_id, usernames_list, av
             ),
         )
     except Exception as e:
-        logger.debug(f"quote: card render failed: {e}")
+        logger.warning(f"quote: card render failed, will try fallback: {type(e).__name__}: {e}")
         return None
 
 
