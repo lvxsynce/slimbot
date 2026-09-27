@@ -564,9 +564,9 @@ def test_body_without_quote_marks():
     import utils.quote_image as qi
     seen = []
     orig = qi._draw_runs
-    def spy(draw, img, x, y, text, font, emoji_px, fill, bold=False):
+    def spy(draw, img, x, y, text, font, emoji_px, fill, bold=False, inline=None):
         seen.append(text)
-        return orig(draw, img, x, y, text, font, emoji_px, fill, bold=bold)
+        return orig(draw, img, x, y, text, font, emoji_px, fill, bold=bold, inline=inline)
     qi._draw_runs = spy
     try:
         render_quote_png(body="hello", sender_name="N", sender_id=1)
@@ -653,3 +653,68 @@ def test_body_lines_compact():
     lines2 = (h2 - h1) // 1
     # шаг высоты за строку текста ≈ BODY_LINE_HEIGHT, а не растянутые 120
     assert (h2 - h1) % BODY_LINE_HEIGHT == 0 or abs((h2 - h1) - BODY_LINE_HEIGHT) < BODY_LINE_HEIGHT
+
+
+def test_custom_emoji_spans_extraction():
+    from telethon.tl.types import MessageEntityCustomEmoji, MessageEntityBold
+    from handlers.commands.quote import _custom_emoji_spans
+    ents = [MessageEntityBold(offset=0, length=2),
+            MessageEntityCustomEmoji(offset=3, length=2, document_id=12345)]
+    spans = _custom_emoji_spans(SimpleNamespace(entities=ents))
+    assert spans == [(3, 2, 12345)]
+    assert _custom_emoji_spans(SimpleNamespace(entities=None)) == []
+    assert _custom_emoji_spans(SimpleNamespace()) == []
+
+
+def test_emoji_placeholders_utf16():
+    from handlers.commands.quote import _apply_emoji_placeholders
+    # '🔥' — астральный символ = 2 UTF-16 юнита; entity offset/length в юнитах
+    text, mapping = _apply_emoji_placeholders("hi 🔥 yo", [(3, 2, 999)])
+    assert len(mapping) == 1
+    pua, doc = next(iter(mapping.items()))
+    assert doc == 999
+    assert text == f"hi {pua} yo"
+    # битый диапазон — текст цел
+    text2, mapping2 = _apply_emoji_placeholders("hi", [(10, 2, 1)])
+    assert text2 == "hi" and mapping2 == {}
+    assert _apply_emoji_placeholders("", []) == ("", {})
+
+
+def test_inline_images_rendered():
+    from PIL import Image
+    red = Image.new("RGBA", (64, 64), color=(255, 0, 0, 255))
+    out = render_quote_png(body="hi  bye", sender_name="N", sender_id=1,
+                           inline_images={"": red})
+    assert out is not None
+    im = Image.open(io.BytesIO(out)).convert("RGB")
+    # красный пиксель inline-картинки в правой колонке (бокс с x=560)
+    found = False
+    for x in range(560, im.width, 10):
+        for y in range(0, im.height, 10):
+            r, g, b = im.getpixel((x, y))
+            if r > 200 and g < 80 and b < 80:
+                found = True
+                break
+    assert found
+
+
+def test_inline_affects_width():
+    from utils.quote_image import _resolve_font, _wrap_text, BODY_FONT_SIZE
+    font = _resolve_font(BODY_FONT_SIZE, "hi")
+    from PIL import Image
+    red = Image.new("RGBA", (100, 50), color=(255, 0, 0, 255))
+    w_plain = _wrap_text("ab", font, max_width=5000, emoji_px=BODY_FONT_SIZE)
+    w_inline = _wrap_text("ab", font, max_width=5000, emoji_px=BODY_FONT_SIZE,
+                          inline={"": red})
+    assert w_plain == w_inline == ["ab"]  # одна строка в обоих случаях
+
+
+def test_unknown_pua_skipped_no_crash():
+    out = render_quote_png(body="hi  bye", sender_name="N", sender_id=1)
+    assert out is not None and len(out) > 1000
+
+
+def test_extended_emoji_ranges_kept():
+    # стрелки/фигуры больше не пропадают и не крашат wrap
+    out = render_quote_png(body="a → b ▶ c #️⃣", sender_name="N", sender_id=1)
+    assert out is not None and len(out) > 1000
