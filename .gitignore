@@ -23,6 +23,10 @@ knowledge.sqlite3-shm
 knowledge.sqlite3-wal
 knowledge_settings.json
 
+# Шаблоны сообщений (`.шаб`): метаданные + тела шаблонов пользователей.
+templates.json
+templates/
+
 # Telethon-сессии (каждый .session — это авторизация).
 sessions/
 *.session

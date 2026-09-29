@@ -59,6 +59,16 @@ from utils.premium import is_entity_premium, invalidate_premium_cache
 
 logger = logging.getLogger(__name__)
 
+# Голова dot-команды для `.шаб` / `.+шаб` / `.-шаб` (шаблоны сообщений).
+# Литерал продублирован намеренно: handlers.commands тянет за собой весь пакет
+# команд, а этот модуль импортируется ими. Дрейф ловит тест
+# tests/test_templates.py::test_dispatch_cmds_match_template_module.
+_TEMPLATE_CMDS = (
+    ".шаб", ".шаблон", ".template", ".tmpl", ".tpl",
+    ".+шаб", ".+шаблон", ".+template", ".+tmpl", ".+tpl",
+    ".-шаб", ".-шаблон", ".-template", ".-tmpl", ".-tpl",
+)
+
 
 def _command_card(title: str, text: str) -> str:
     """Apply the shared command layout without creating an import cycle."""
@@ -1076,6 +1086,9 @@ class TelethonManager:
         elif head in (".quote", ".цитата", ".q", ".цит"):
             from handlers.commands.quote import handle as handle_quote
             await handle_quote(user_id, event)
+        elif head in _TEMPLATE_CMDS:
+            from handlers.commands.template import handle as handle_template
+            await handle_template(user_id, event)
         elif head in (".ня",):
             from handlers.commands.nya import handle as handle_nya
             await handle_nya(user_id, event)

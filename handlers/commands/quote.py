@@ -10,6 +10,14 @@ PNG rendering v2 реализован в utils/quote_image.py (PIL/Pillow + Deja
 Layout: прямоугольный, avatar слева вверху, semi-transparent bubble-overlay
 под body текстом, info-строка с ID + @usernames + timestamp.
 
+Поддерживаемые media реплая:
+- фото → фон карточки;
+- видео / GIF / **кружок (video_note)** → анимированная GIF-цитата; для кружка
+  дополнительно ставится круглая маска (Telegram отдаёт квадрат 200x200);
+- голосовое/аудио → mp4 (кадр-карточка + AAC-звук);
+- **анимированные custom emoji** (Premium) — TGS растрируется через
+  rlottie-python, WEBM через ffmpeg; нескачанные остаются обычным глифом.
+
 Если Pillow/font недоступны или render fails → graceful fallback на HTML.
 """
 import asyncio
@@ -66,27 +74,36 @@ def _build_caption(first: str, last: str, fallback_name: str, sender_id, usernam
 
 _ANIMATED_STICKER_MIMES = {"application/x-tgsticker", "application/x-tgs-sticker"}
 
+# PUA-диапазон для маркеров custom emoji в тексте цитаты.
+# Кастомные эмодзи — не Unicode-символы, а ссылки на документы
+# (MessageEntityCustomEmoji.document_id). Чтобы отрисовать их в строку,
+# диапазон entity заменяем на PUA-маркер (U+E000…), а картинку передаём
+# в рендерер через `inline_images={маркер: RGBA Image}`.
+_PUA_BASE = 0xE000
+_PUA_COUNT = 0xF8FF - 0xE000
+
 
 def _reply_media_kind(reply) -> str | None:
-    """Классификация media реплая для .q: 'video' | 'photo' | None.
+    """Классификация media реплая для .q.
+
+    Возвращает: 'video' | 'video_note' | 'photo' | 'sticker' | None.
 
     - video: video / animation (GIF) / документ с video-mime.
-    - photo: photo / документ с image-mime (включая статичные стикеры — нет,
-      стикеры отклоняем: это не фото).
-    Кружки (video_note), анимированные стикеры (TGS) и всё остальное → None
-    (только статичная карточка с заглушкой).
+    - video_note: кружок. Отдельный вид нужен только ради круглой маски —
+      файл там обычный квадратный mp4 200x200, круг рисует клиент.
+    - photo: photo / документ с image-mime.
+    - sticker: стикер, включая анимированные (TGS) и видео (webm). Раньше
+      отбрасывался целиком, из-за чего `.q` на стикере давал пустую карточку.
     """
     if reply is None:
         return None
     doc = getattr(reply, "document", None)
     mime = (getattr(doc, "mime_type", "") or "") if doc else ""
-    if mime in _ANIMATED_STICKER_MIMES:
-        return None
     if getattr(reply, "sticker", None):
-        return None
+        return "sticker"
     if getattr(reply, "video_note", None):
-        # Кружки — только статичная карточка с заглушкой, без GIF-пути.
-        return None
+        # Кружок: квадратный mp4, но помечается отдельно ради circle-маски.
+        return "video_note"
     if (
         getattr(reply, "video", None)
         or getattr(reply, "animation", None)
@@ -96,7 +113,242 @@ def _reply_media_kind(reply) -> str | None:
         return "video"
     if getattr(reply, "photo", None) or mime.startswith("image/"):
         return "photo"
+    if mime in _ANIMATED_STICKER_MIMES:
+        # Старый формат стикеров (и часть custom-emoji) без поля .sticker.
+        return "sticker"
     return None
+
+
+async def _sticker_to_quote_media(data: bytes) -> tuple[bytes | None, bytes | None]:
+    """Стикер → (gif_bytes | None, still_png_bytes | None).
+
+    Анимированный стикер (TGS / webm) отдаём как GIF — он идёт в GIF-ветку
+    цитаты и анимируется. Если кадров один (или нечем анимировать) —
+    отдаём статичный кадр, чтобы в карточке хоть что-то было.
+    """
+    if not data:
+        return None, None
+    from utils.gif_converter import (
+        frames_to_gif_bytes, rgba_frame_to_png_bytes, tgs_to_rgba_frames,
+        webm_frame_durations, webm_to_rgba_frames,
+    )
+    frames, durations = [], []
+    if data[:2] == b"\x1f\x8b":
+        # TGS: rlottie (CPU-bound, но быстрый — десятки кадров 128px).
+        frames = tgs_to_rgba_frames(data)
+        if frames:
+            durations = webm_frame_durations(len(frames))
+    elif data[:4] in (b"RIFF", b"\x89PNG", b"\xff\xd8\xff") or data[:6] in (
+        b"GIF87a", b"GIF89a",
+    ):
+        # Статичный webp/png/jpeg/gif-стикер — ffmpeg тут не нужен,
+        # отдаём картинку как есть (фото-ветка карточки).
+        return None, data
+    else:
+        # WEBM/MKV: ffmpeg. Альфа лежит в BlockAdditions → нужен -c:v libvpx-vp9.
+        frames = await webm_to_rgba_frames(data)
+        if frames:
+            durations = webm_frame_durations(len(frames))
+    if not frames:
+        # Ничего не декодировалось — отдаём как есть (напр. статичный webp).
+        return None, data
+    if len(frames) > 1:
+        gif = frames_to_gif_bytes(frames, durations)
+        if gif:
+            return gif, None
+    return None, rgba_frame_to_png_bytes(frames[0])
+
+
+def _custom_emoji_spans(reply) -> list[tuple[int, int, int]]:
+    """[(offset, length, document_id)] custom emoji из entities. Pure.
+
+    Оффсеты Telegram — в UTF-16 code units (астральные эмодзи = 2 юнита),
+    поэтому длины считаются в юнитах, а не в символах.
+    """
+    spans = []
+    for ent in getattr(reply, "entities", None) or []:
+        if ent.__class__.__name__ != "MessageEntityCustomEmoji":
+            continue
+        doc_id = getattr(ent, "document_id", None)
+        if doc_id:
+            spans.append((
+                getattr(ent, "offset", 0) or 0,
+                getattr(ent, "length", 0) or 0,
+                doc_id,
+            ))
+    return spans
+
+
+def _apply_emoji_placeholders(text: str, spans: list[tuple[int, int, int]],
+                              available: set[int] | None = None
+                              ) -> tuple[str, dict[str, int]]:
+    """Заменяет диапазоны custom emoji на PUA-маркеры. Pure.
+
+    Заменяются ТОЛЬКО document_id из `available` (кадры скачались);
+    остальные оставляем исходным символом — иначе эмодзи исчезнет из цитаты
+    целиком (PUA без картинки намеренно не рисуется). `available=None` =
+    заменять все (для тестов). Возвращает (текст, {pua_char: document_id}).
+    """
+    if not text or not spans:
+        return text, {}
+    try:
+        units = text.encode("utf-16-le")
+    except Exception:
+        return text, {}
+    out = bytearray()
+    mapping: dict[str, int] = {}
+    idx = 0
+    pos = 0
+    for off, ln, doc_id in sorted(spans):
+        if available is not None and doc_id not in available:
+            continue
+        start, end = off * 2, (off + ln) * 2
+        if ln <= 0 or start < pos or end > len(units):
+            continue
+        out += units[pos:start]
+        pua = chr(_PUA_BASE + (idx % _PUA_COUNT))
+        idx += 1
+        out += pua.encode("utf-16-le")
+        mapping[pua] = doc_id
+        pos = end
+    out += units[pos:]
+    try:
+        return bytes(out).decode("utf-16-le"), mapping
+    except Exception:
+        return text, {}
+
+
+def _pillow_first_frame(data: bytes):
+    """Статика (webp/png/jpeg/gif) → ([RGBA], [100]). ([], []) если битое."""
+    if not data:
+        return [], []
+    try:
+        from PIL import Image
+        import io as _io
+        im = Image.open(_io.BytesIO(data))
+        try:
+            if getattr(im, "is_animated", False):
+                im.seek(0)
+        except Exception:
+            pass
+        im.thumbnail((128, 128))
+        return [im.convert("RGBA")], [100]
+    except Exception:
+        return [], []
+
+
+async def _fetch_custom_emoji(client, doc_ids) -> dict:
+    """{document_id: {'frames': [RGBA...], 'durations': [ms...]}}.
+
+    Источники по mime:
+    - application/x-tgsticker (TGS = gzip+Lottie) → rlottie-python растрирует
+      в RGBA-кадры; если rlottie нет — статичный thumb с серверов Telegram;
+    - video/* (webm VP9+alpha) → RGBA-кадры через ffmpeg (см. webm_to_rgba_frames;
+      альфа лежит в Matroska BlockAdditions и требует -c:v libvpx-vp9);
+    - остальное (webp/png/gif) → первый кадр через Pillow.
+
+    Пустые/битые документы пропускаются — caller оставит исходный символ.
+    """
+    res: dict = {}
+    ids = [i for i in dict.fromkeys(doc_ids or []) if i]
+    if not ids or client is None:
+        return res
+    try:
+        from telethon.tl.functions.messages import GetCustomEmojiDocumentsRequest
+        docs = await asyncio.wait_for(
+            client(GetCustomEmojiDocumentsRequest(document_id=ids)), timeout=15)
+    except Exception as e:
+        logger.debug(f"quote: custom emoji fetch failed: {e}")
+        return res
+    for doc in docs or []:
+        doc_id = getattr(doc, "id", None)
+        if not doc_id or doc_id in res:
+            continue
+        try:
+            mime = getattr(doc, "mime_type", "") or ""
+            if mime in _ANIMATED_STICKER_MIMES:
+                data = await asyncio.wait_for(
+                    client.download_media(doc, file=bytes), timeout=20)
+                from utils.gif_converter import tgs_to_rgba_frames
+                frames = tgs_to_rgba_frames(data) if data else []
+                how = "rlottie"
+                if not frames:
+                    # rlottie недоступен / TGS битый → статичный ПРЕВЬЮ-кадр
+                    # с серверов Telegram. Перебираем thumbs по индексу: для
+                    # анимированных стикеров там бывает VideoSize (webm),
+                    # который Pillow не открывает, а `thumb=-1` («наибольший»)
+                    # может указывать ровно на него.
+                    how = "thumb"
+                    frames, durations = [], []
+                    for idx in range(len(getattr(doc, "thumbs", None) or [])):
+                        try:
+                            tb = await asyncio.wait_for(
+                                client.download_media(doc, file=bytes, thumb=idx),
+                                timeout=20)
+                        except Exception:
+                            tb = None
+                        if not tb:
+                            continue
+                        frames, durations = _pillow_first_frame(tb)
+                        if frames:
+                            how = f"thumb[{idx}]"
+                            break
+                    frames = frames[:1]
+                else:
+                    from utils.gif_converter import webm_frame_durations
+                    durations = webm_frame_durations(len(frames))
+                logger.warning(
+                    "quote emoji: doc=%s mime=%s tgs_bytes=%s frames=%s via=%s",
+                    doc_id, mime, len(data or b""), len(frames), how,
+                )
+            elif mime.startswith("video/"):
+                data = await asyncio.wait_for(
+                    client.download_media(doc, file=bytes), timeout=20)
+                if not data:
+                    continue
+                from utils.gif_converter import (
+                    webm_frame_durations, webm_to_rgba_frames)
+                frames = await webm_to_rgba_frames(data)
+                if not frames:
+                    frames, durations = _pillow_first_frame(data), [100]
+                else:
+                    durations = webm_frame_durations(len(frames))
+                logger.warning(
+                    "quote emoji: doc=%s mime=%s webm_bytes=%s frames=%s",
+                    doc_id, mime, len(data), len(frames),
+                )
+            else:
+                data = await asyncio.wait_for(
+                    client.download_media(doc, file=bytes), timeout=20)
+                frames, durations = _pillow_first_frame(data) if data else ([], [])
+                logger.warning(
+                    "quote emoji: doc=%s mime=%s static_bytes=%s frames=%s",
+                    doc_id, mime, len(data or b""), len(frames),
+                )
+            if frames:
+                res[doc_id] = {"frames": frames, "durations": durations or [100] * len(frames)}
+        except Exception as e:
+            logger.warning(
+                f"quote emoji: doc {doc_id} FAILED: {type(e).__name__}: {e}")
+    return res
+
+
+def _select_anim_phases(n_frames: int, cap: int = 8) -> list[int]:
+    """Равномерные индексы фаз анимации (≤cap). Pure."""
+    if n_frames <= 0:
+        return []
+    k = min(cap, n_frames)
+    if k == 1:
+        return [0]
+    return sorted({round(i * (n_frames - 1) / (k - 1)) for i in range(k)})
+
+
+def _decode_emoji_frame(data: bytes, mime: str):
+    """Legacy: первый кадр → PIL RGBA. Используется тестами."""
+    if (mime or "") in _ANIMATED_STICKER_MIMES:
+        return None
+    frames, _ = _pillow_first_frame(data)
+    return frames[0] if frames else None
 
 
 def _voice_duration(reply) -> int | None:
@@ -172,12 +424,22 @@ def _scaled_video_size(card_png: bytes, max_width: int = 960) -> tuple[int, int]
         return 960, 540
 
 
-async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str):
-    """Info-плашка (слева от GIF-кадров) в executor'е. None если недоступно."""
+async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str,
+                       inline_images=None, scale=None):
+    """Info-плашка (слева от GIF-кадров) в executor'е. None если недоступно.
+
+    ``scale`` — изотропный множитель разрешения плашки. Плашка потом
+    масштабируется под высоту кадра, поэтому её выгодно рисовать с запасом:
+    даунскейл текста чёткий, апскейл — каша. Масштабировать нужно обе оси,
+    иначе плашка получит неверную пропорцию.
+    """
     try:
         from utils.quote_image import render_info_strip_png, is_available as pillow_ok
         if not pillow_ok():
             return None
+        kwargs = {}
+        if scale:
+            kwargs["scale"] = scale
         return await asyncio.get_running_loop().run_in_executor(
             None,
             lambda: render_info_strip_png(
@@ -187,6 +449,8 @@ async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, 
                 avatar_bytes=avatar_bytes,
                 timestamp=date_str,
                 body=body_text,
+                inline_images=inline_images,
+                **kwargs,
             ),
         )
     except Exception as e:
@@ -194,7 +458,8 @@ async def _render_info_strip(body_text, sender_name, sender_id, usernames_list, 
         return None
 
 
-async def _render_card_png(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str, background_bytes=None):
+async def _render_card_png(body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str, background_bytes=None,
+                     inline_images=None):
     """PNG-карточка в executor'е (CPU-heavy Pillow). None если недоступно."""
     try:
         from utils.quote_image import render_quote_png, is_available as pillow_ok
@@ -210,6 +475,7 @@ async def _render_card_png(body_text, sender_name, sender_id, usernames_list, av
                 avatar_bytes=avatar_bytes,
                 timestamp=date_str,
                 background_bytes=background_bytes,
+                inline_images=inline_images,
             ),
         )
     except Exception as e:
@@ -263,12 +529,72 @@ async def handle(user_id: str, event) -> None:
         except Exception:
             pass
 
-    # Body — text or caption. Без поддержки custom emoji: исходный символ
-    # остаётся как есть (статичный глиф системного шрифта).
-    body = (getattr(reply, "raw_text", "") or getattr(reply, "message", "") or "").strip()
+    # Body — text or caption. Custom (анимированные) emoji — это НЕ символы
+    # Unicode, а ссылки на документы (entity document_id). Сначала качаем
+    # кадры (TGS → rlottie, webm → ffmpeg, статика → 1 кадр) и ТОЛЬКО
+    # скачанные заменяем на PUA-маркеры: остальные оставляем исходным
+    # символом, иначе эмодзи исчезнет из цитаты полностью.
+    # Замена ДО strip — оффсеты entities относятся к исходному тексту.
+    raw_source = (getattr(reply, "raw_text", "") or getattr(reply, "message", "") or "")
+    if not raw_source:
+        raw_source = (getattr(reply, "caption", "") or "")
+    spans = _custom_emoji_spans(reply)
+    if spans:
+        # Что реально лежит в тексте на месте каждого entity: PUA-символ или
+        # обычный Unicode-эмодзи (alt). От этого зависит фолбэк-стратегия.
+        _probe = []
+        for _off, _ln, _did in spans:
+            try:
+                _u = raw_source.encode("utf-16-le")
+                _ch = _u[_off * 2:_off * 2 + _ln * 2].decode("utf-16-le", "replace")
+                _probe.append(f"U+{ord(_ch[0]):04X}" if _ch else "empty")
+            except Exception as _e:
+                _probe.append(f"err:{_e}")
+        logger.warning(
+            "quote: spans=%d chars=%s", len(spans), ",".join(_probe),
+        )
+    emoji_data: dict = {}
+    inline_images: dict = {}
+    # {marker: (frames, total_cycle_ms)} — для анимированных фаз в GIF-цитате.
+    anim_entries: dict = {}
+    body = raw_source
+    if spans:
+        try:
+            emoji_data = await asyncio.wait_for(
+                _fetch_custom_emoji(getattr(event, "client", None),
+                                    [doc_id for _, _, doc_id in spans]),
+                timeout=60,
+            )
+        except Exception as e:
+            logger.warning(
+                f"quote: custom emoji fetch FAILED: {type(e).__name__}: {e}")
+            emoji_data = {}
+        # ВАЖНО: передаём именно set(emoji_data) — пустой set, а не None.
+        # `None` в _apply_emoji_placeholders означает «заменить ВСЕ диапазоны»,
+        # и тогда непокрытые эмодзи превратятся в PUA-маркеры без картинки →
+        # `_draw_runs` их молча пропустит и эмодзи исчезнет из цитаты.
+        body, marker_map = _apply_emoji_placeholders(
+            raw_source, spans, set(emoji_data),
+        )
+        logger.warning(
+            "quote: requested=%d fetched=%d replaced=%d",
+            len({d for _, _, d in spans}), len(emoji_data), len(marker_map),
+        )
+        for marker, doc_id in marker_map.items():
+            entry = emoji_data.get(doc_id) or {}
+            frames = entry.get("frames") or []
+            if not frames:
+                continue
+            inline_images[marker] = frames[0]
+            if len(frames) > 1:
+                durations = entry.get("durations") or []
+                anim_entries[marker] = (
+                    frames, sum(durations) if durations else 100 * len(frames),
+                )
+    body = body.strip()
     if not body:
         body = (getattr(reply, "caption", "") or "").strip()
-    # Кружок без текста — заглушка вместо GIF.
+    # Кружок без текста — подпись-заглушка (GIF-кадры идут справа).
     if not body and getattr(reply, "video_note", None):
         body = "📹 Видеосообщение"
     # Звук детектим независимо от текста: аудио+подпись тоже идёт в видео.
@@ -345,13 +671,15 @@ async def handle(user_id: str, event) -> None:
     # в шапке). Цитата уходит только фоткой, без текста под ней. ----
     # _build_caption оставлен для совместимости (тесты), но не используется.
 
-    # ---- Классификация media реплая: фон (фото) / GIF-путь (видео, incl. кружки) / звук ----
+    # ---- Классификация media реплая: фон (фото) / GIF-путь (видео + кружки) / звук ----
     background_bytes: bytes | None = None
     video_bytes: bytes | None = None
     audio_bytes: bytes | None = None
+    is_video_note = False
     try:
         media_kind = _reply_media_kind(reply)
-        if media_kind == "video":
+        if media_kind in ("video", "video_note"):
+            is_video_note = media_kind == "video_note"
             size = None
             for holder in (getattr(reply, "document", None), getattr(reply, "video", None),
                            getattr(reply, "video_note", None), getattr(reply, "animation", None)):
@@ -360,8 +688,37 @@ async def handle(user_id: str, event) -> None:
                     break
             if not size or size <= QUOTE_VIDEO_MAX_BYTES:
                 video_bytes = await reply.download_media(file=bytes)
+            logger.warning(
+                "quote media: kind=%s size=%s downloaded=%s",
+                media_kind, size, len(video_bytes or b"") or 0,
+            )
         elif media_kind == "photo":
             background_bytes = await reply.download_media(file=bytes)
+            logger.warning(
+                "quote media: kind=photo downloaded=%s",
+                len(background_bytes or b"") or 0,
+            )
+        elif media_kind == "sticker":
+            # Стикер (в т.ч. анимированный TGS / видео webm): качаем и
+            # превращаем либо в GIF (анимация), либо в статичный кадр.
+            raw = await reply.download_media(file=bytes)
+            video_bytes, background_bytes = await _sticker_to_quote_media(raw)
+            logger.warning(
+                "quote media: kind=sticker raw=%s gif=%s still=%s",
+                len(raw or b""), len(video_bytes or b"") or 0,
+                len(background_bytes or b"") or 0,
+            )
+        else:
+            logger.warning(
+                "quote media: kind=%s (no video/photo path) mime=%s "
+                "video_note=%s video=%s animation=%s sticker=%s",
+                media_kind, (getattr(getattr(reply, "document", None), "mime_type", "")
+                             or "") if getattr(reply, "document", None) else "",
+                bool(getattr(reply, "video_note", None)),
+                bool(getattr(reply, "video", None)),
+                bool(getattr(reply, "animation", None)),
+                bool(getattr(reply, "sticker", None)),
+            )
         if audio_attach:
             asize = None
             for holder in (getattr(reply, "voice", None), getattr(reply, "document", None),
@@ -372,22 +729,64 @@ async def handle(user_id: str, event) -> None:
             if not asize or asize <= QUOTE_VIDEO_MAX_BYTES:
                 audio_bytes = await reply.download_media(file=bytes)
     except Exception as e:
-        logger.debug(f"quote: reply media download failed: {e}")
+        logger.warning(f"quote: reply media download FAILED: {type(e).__name__}: {e}")
 
-    # ---- Попытка 0: GIF-цитата (видео/анимация/GIF в реплае) ----
+    # ---- Попытка 0: GIF-цитата (видео / анимация / GIF / кружок) ----
     # Слева info-плашка (инфо + подпись), справа кадры из реплая.
     if video_bytes:
+        # Плашку рисуем в 2x разрешения: в `_stack_gif_side_by_side` она
+        # масштабируется под высоту кадра (обычно вниз), и текст остаётся чётким.
+        strip_scale = 2.0
+        logger.warning(
+            "quote gif: start is_video_note=%s bytes=%s",
+            is_video_note, len(video_bytes),
+        )
         png_card = await _render_info_strip(
             body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str,
+            inline_images=inline_images, scale=strip_scale,
         )
+        # Анимированный custom-emoji: для GIF-цитаты рендерим info-плашку
+        # по фазам анимации, иначе эмодзи в тексте было бы статичным.
+        # Анимируем только самое длинное из эмодзи (остальные — статикой):
+        # иначе плашка размножится на len(эмодзи) картинок в executor'е.
+        anim_strips: list | None = None
+        anim_duration_ms = 0
+        if anim_entries:
+            marker, (frames, cycle_ms) = max(
+                anim_entries.items(), key=lambda kv: len(kv[1][0]))
+            phases = _select_anim_phases(len(frames))
+            if len(phases) > 1:
+                strips = []
+                for ph in phases:
+                    st = await _render_info_strip(
+                        body_text, sender_name, sender_id, usernames_list,
+                        avatar_bytes, date_str,
+                        inline_images={**inline_images, marker: frames[ph]},
+                        scale=strip_scale,
+                    )
+                    if st:
+                        strips.append(st)
+                if strips:
+                    anim_strips = strips
+                    anim_duration_ms = max(1, cycle_ms)
         if png_card:
             try:
                 from utils.quote_image import render_video_quote_gif
                 gif_bytes = await render_video_quote_gif(
-                    video_bytes, card_png_bytes=png_card)
+                    video_bytes, card_png_bytes=png_card,
+                    anim_strips=anim_strips, anim_duration_ms=anim_duration_ms,
+                    circle=is_video_note,
+                )
             except Exception as e:
-                logger.debug(f"quote: video GIF render failed: {e}")
+                logger.warning(
+                    f"quote gif: render_video_quote_gif FAILED: {type(e).__name__}: {e}")
                 gif_bytes = None
+            if not png_card:
+                logger.warning("quote gif: info strip render FAILED (pillow/fonts?)")
+            elif not gif_bytes:
+                logger.warning(
+                    "quote gif: render_video_quote_gif returned None "
+                    "(ffmpeg? palette? >12MB?)")
             if gif_bytes:
                 try:
                     from telethon.tl.types import DocumentAttributeAnimated
@@ -417,6 +816,7 @@ async def handle(user_id: str, event) -> None:
     if audio_bytes:
         audio_card = await _render_card_png(
             body_text, sender_name, sender_id, usernames_list, avatar_bytes, date_str,
+            inline_images=inline_images,
         )
         if audio_card:
             try:
@@ -459,7 +859,7 @@ async def handle(user_id: str, event) -> None:
     sent = False
     png_bytes = await _render_card_png(
         body_text, sender_name, sender_id, usernames_list,
-        avatar_bytes, date_str, background_bytes,
+        avatar_bytes, date_str, background_bytes, inline_images,
     )
     if png_bytes:
         try:

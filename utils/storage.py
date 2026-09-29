@@ -12,6 +12,8 @@ from config import (
     USER_TZ_FILE,
     NYA_CHATS_FILE,
     KNOWLEDGE_SETTINGS_FILE,
+    TEMPLATES_FILE,
+    TEMPLATES_DIR,
     SESSIONS_DIR,
 )
 
@@ -30,6 +32,9 @@ user_timezones: dict[str, str] = {}
 nya_chats: dict[str, list[int]] = {}
 # user_id -> {"selected_chats": [chat_id, ...]}; пустой список = сбор не запустится.
 knowledge_settings: dict[str, dict] = {}
+# user_id -> {normalized_name: record} — шаблоны сообщений (.шаб).
+# Сами медиа лежат на диске в TEMPLATES_DIR, здесь только метаданные.
+templates: dict[str, dict[str, dict]] = {}
 
 _processed_msgs: dict[tuple[int, int, int], float] = {}
 _processed_last_cleanup = 0.0
@@ -486,6 +491,168 @@ def toggle_knowledge_chat(user_id: str, chat_id: int) -> bool:
     return enabled
 
 
+# ----------------- .шаб шаблоны сообщений -----------------
+# Запись шаблона:
+#   {"name": "привет", "kind": "text", "text": "..."}
+#   {"name": "поздравление", "kind": "photo", "file": "ab12….jpg",
+#    "mime": "image/jpeg", "size": 12345, "w": 800, "h": 600}
+# Ключ в templates[uid] — нормализованное имя (lower + collapse spaces),
+# поэтому поиск регистронезависимый.
+
+_ALLOWED_FIELDS = (
+    "name", "kind", "text", "file", "ext", "mime", "size", "w", "h",
+    "duration", "created", "phone", "first_name", "last_name", "vcard",
+    "user_id", "lat", "long", "title", "performer",
+)
+
+
+def normalize_template_name(name: str) -> str:
+    """lower + схлопывание пробелов + trim. Pure."""
+    return " ".join(str(name or "").strip().lower().split())
+
+
+def template_dir(user_id: str) -> Path:
+    """Каталог файлов шаблонов пользователя (создаётся при сохранении)."""
+    h = hashlib.sha256(str(user_id).encode()).hexdigest()[:16]
+    return TEMPLATES_DIR / h
+
+
+def template_blob_name(name: str, ext: str) -> str:
+    """Имя файла на диске: хэш имени + расширение.
+
+    Имя шаблона может быть любым (кириллица, пробелы, `/`, `..`), поэтому
+    в путь оно не попадает — только необратимый хэш. Плюс slug от первых
+    символов, чтобы файлы в каталоге читались глазами при отладке.
+    """
+    h = hashlib.sha256(str(name).encode()).hexdigest()[:16]
+    slug = "".join(ch for ch in str(name).lower() if ch.isalnum())[:24]
+    ext = (ext or "").lstrip(".")
+    return f"{h}_{slug}.{ext}" if ext else f"{h}_{slug}"
+
+
+def load_templates():
+    global templates
+    if TEMPLATES_FILE.exists() or TEMPLATES_FILE.with_suffix(TEMPLATES_FILE.suffix + ".bak").exists():
+        try:
+            raw = _read_json(TEMPLATES_FILE, {})
+            parsed: dict[str, dict[str, dict]] = {}
+            if isinstance(raw, dict):
+                for uid, value in raw.items():
+                    if not isinstance(value, dict):
+                        continue
+                    bucket: dict[str, dict] = {}
+                    for name, rec in value.items():
+                        if not isinstance(rec, dict):
+                            continue
+                        if not rec.get("kind"):
+                            continue
+                        clean = {k: rec[k] for k in _ALLOWED_FIELDS if k in rec}
+                        clean["name"] = str(clean.get("name") or name)
+                        bucket[normalize_template_name(name)] = clean
+                    if bucket:
+                        parsed[str(uid)] = bucket
+            templates = parsed
+        except Exception:
+            templates = {}
+    else:
+        templates = {}
+
+
+def save_templates():
+    _atomic_write(TEMPLATES_FILE, templates)
+
+
+def get_templates(user_id: str) -> dict[str, dict]:
+    return templates.get(str(user_id), {})
+
+
+def get_template(user_id: str, name: str) -> dict | None:
+    return get_templates(user_id).get(normalize_template_name(name))
+
+
+def templates_total_bytes(user_id: str) -> int:
+    return sum(
+        int(rec.get("size") or 0) for rec in get_templates(user_id).values()
+    )
+
+
+def put_template(user_id: str, name: str, record: dict) -> dict:
+    """Сохраняет/перезаписывает шаблон. Возвращает нормализованное имя."""
+    key = normalize_template_name(name)
+    clean = {k: v for k, v in record.items() if k in _ALLOWED_FIELDS}
+    clean["name"] = str(name)
+    templates.setdefault(str(user_id), {})[key] = clean
+    save_templates()
+    return key
+
+
+def delete_template(user_id: str, name: str) -> dict | None:
+    """Удаляет шаблон + файл на диске. Возвращает удалённую запись или None."""
+    uid = str(user_id)
+    key = normalize_template_name(name)
+    bucket = templates.get(uid)
+    if not bucket or key not in bucket:
+        return None
+    rec = bucket.pop(key)
+    if not bucket:
+        templates.pop(uid, None)
+    _unlink_template_blob(uid, rec)
+    save_templates()
+    return rec
+
+
+def template_blob_path(user_id: str, record: dict) -> Path | None:
+    blob = (record or {}).get("file")
+    if not blob:
+        return None
+    return template_dir(user_id) / blob
+
+
+def _unlink_template_blob(user_id: str, record: dict) -> None:
+    path = template_blob_path(user_id, record)
+    if not path:
+        return
+    try:
+        path.unlink()
+    except OSError:
+        pass
+
+
+def drop_template_blob(user_id: str, record: dict) -> None:
+    """Удаляет файл шаблона, не трогая метаданные.
+
+    Нужен при перезаписи шаблона: имя файла выводится из (имя, ext), поэтому
+    при смене расширения старый blob осиротеет и будет есть место на диске.
+    """
+    _unlink_template_blob(user_id, record)
+
+
+def read_template_blob(user_id: str, record: dict) -> bytes | None:
+    """Читает файл шаблона. None если файла нет (был удалён руками)."""
+    path = template_blob_path(user_id, record)
+    if not path or not path.exists():
+        return None
+    try:
+        return path.read_bytes()
+    except OSError:
+        return None
+
+
+def write_template_blob(user_id: str, name: str, data: bytes, ext: str) -> str:
+    """Пишет файл шаблона, возвращает blob-имя для метаданных."""
+    d = template_dir(user_id)
+    d.mkdir(parents=True, exist_ok=True)
+    blob = template_blob_name(name, ext)
+    path = d / blob
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return blob
+
+
 load_watched()
 load_user_sessions()
 load_photo_settings()
@@ -493,3 +660,4 @@ load_auto_tr_chats()
 load_user_tz()
 load_nya_chats()
 load_knowledge_settings()
+load_templates()
