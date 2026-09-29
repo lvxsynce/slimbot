@@ -158,6 +158,19 @@ NYA_EDIT_DELAY = _float_env("NYA_EDIT_DELAY", 0.6)           # задержка 
 # Лимит целей для .who @a @b @c / inline @user1 @user2 @user3.
 DOT_TARGET_LIMIT = _int_env("DOT_TARGET_LIMIT", 5)
 
+# `.шаб` — шаблоны сообщений (Telethon-only: нужен MTProto для сохранения
+# и пере-отправки media любых типов — кружок/голосовое/стикер/контакт).
+#
+# Лимиты щедрые: шаблон — это то, что юзер пересылает много раз, и обрезать
+# ему видео ради экономии не нужно. 50МБ на файл — тот же порог, который
+# Telegram использует для загрузки файлов, так что отказ по размеру будет
+# означать настоящую проблему, а не искусственное ограничение.
+TEMPLATE_MAX_BYTES = _int_env("TEMPLATE_MAX_BYTES", 50 * 1024 * 1024)
+TEMPLATE_MAX_COUNT = _int_env("TEMPLATE_MAX_COUNT", 500)
+TEMPLATE_MAX_TOTAL_BYTES = _int_env("TEMPLATE_MAX_TOTAL_BYTES", 1024 * 1024 * 1024)
+TEMPLATE_LIST_PAGE_SIZE = _int_env("TEMPLATE_LIST_PAGE_SIZE", 10)
+TEMPLATE_NAME_MAX_LEN = _int_env("TEMPLATE_NAME_MAX_LEN", 64)
+
 # Telethon entity-resolve timeout (get_entity, GetFullUserRequest, GetFullChannelRequest).
 TELETHON_RESOLVE_TIMEOUT = _int_env("TELETHON_RESOLVE_TIMEOUT", 10)
 # Telethon send timeout (send_message / send_file).
@@ -225,6 +238,11 @@ PHOTO_SETTINGS_FILE = DATA_DIR / "photo_settings.json"
 AUTO_TR_CHATS_FILE = DATA_DIR / "auto_tr_chats.json"
 USER_TZ_FILE = DATA_DIR / "user_timezones.json"
 NYA_CHATS_FILE = DATA_DIR / "nya_chats.json"
+# .шаб — шаблоны сообщений. Метаданные в templates.json, сами файлы — в
+# templates/<user_hash>/<sha256(имя)[:16]>.<ext> (имя шаблона может содержать
+# любые символы, поэтому в имя файла оно не попадает).
+TEMPLATES_FILE = DATA_DIR / "templates.json"
+TEMPLATES_DIR = DATA_DIR / "templates"
 KNOWLEDGE_DB_FILE = DATA_DIR / "knowledge.sqlite3"
 KNOWLEDGE_SETTINGS_FILE = DATA_DIR / "knowledge_settings.json"
 

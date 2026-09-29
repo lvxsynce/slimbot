@@ -431,13 +431,63 @@ def _emoji_glyph(ch: str, px: int):
     return out
 
 
-def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int, bold: bool = False) -> float:
-    """Ширина строки: текст — посимвольно через font-fallback chain, emoji — глифы."""
+# ===== Custom (анимированные Premium) эмодзи =====
+# Telegram-кастомные эмодзи — это отдельные документы (TGS/Lottie или
+# WEBM/VP9+alpha), а НЕ символы Unicode. В тексте они лежат как
+# `MessageEntityCustomEmoji(document_id=...)`, а сам символ-заглушка —
+# стандартный Unicode-эмодзи (🔥 и т.п.).
+#
+# В `handle()` диапазоны этих entity заменяются на PUA-маркеры
+# (U+E000…), и сюда передаётся словарь `{маркер: RGBA-кадр}`. Если маркер
+# не скачался (нет rlottie / битый файл / offline) — маркер НЕ рисуется
+# вообще, и мы НЕ рисуем tofu: PUA-диапазон не имеет глифа ни в одном
+# шрифте цепочки, поэтому молча пропускаем символ.
+def _is_pua(ch: str) -> bool:
+    """Private-use маркер custom emoji (U+E000–U+F8FF)."""
+    return len(ch) == 1 and 0xE000 <= ord(ch) <= 0xF8FF
+
+
+def _inline_advance(im, px: int) -> int:
+    """Ширина inline-картинки при высоте px (aspect preserved)."""
+    try:
+        return max(1, int(im.width * max(1, int(px)) / max(im.height, 1)))
+    except Exception:
+        return int(px)
+
+
+def _inline_frame_for(inline: dict, ch: str):
+    """Кадр custom-эмодзи для маркера. None если маркера нет.
+
+    Значение в `inline` — либо один PIL.Image (статика), либо список
+    кадров (анимация; для статичного PNG берём первый).
+    """
+    im = inline.get(ch)
+    if im is None:
+        return None
+    if isinstance(im, (list, tuple)):
+        return im[0] if im else None
+    return im
+
+
+def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int, bold: bool = False,
+                inline: dict | None = None) -> float:
+    """Ширина строки: inline-картинки, emoji-глифы, текст через font-fallback."""
     size = getattr(font, "size", emoji_px) or emoji_px
     total = 0.0
     for kind, chunk in runs:
         if kind == "t":
             for ch in chunk:
+                if inline:
+                    im = _inline_frame_for(inline, ch)
+                    if im is not None:
+                        total += _inline_advance(im, emoji_px)
+                        continue
+                if _is_pua(ch):
+                    # Маркер без картинки — молча пропускаем, не tofu.
+                    # Проверка ВНЕ `if inline`: PUA-символ не имеет глифа
+                    # ни в одном шрифте цепочки, поэтому без этой строки он
+                    # превратится в пустой прямоугольник.
+                    continue
                 if ch not in _EMOJI_SKIP and _EMOJI_RUN_RE.match(ch):
                     g = _emoji_glyph(ch, emoji_px)
                     if g is not None:
@@ -457,8 +507,8 @@ def _runs_width(runs: list[tuple[str, str]], font, emoji_px: int, bold: bool = F
 
 
 def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fill,
-               bold: bool = False) -> float:
-    """Рисует строку: цветные emoji + текст (посимвольный font-fallback).
+               bold: bool = False, inline: dict | None = None) -> float:
+    """Рисует строку: inline-картинки + цветные emoji + текст (font-fallback).
 
     Возвращает x конца. Baseline: глифы вписываются в высоту строки
     (emoji_px ≈ размер шрифта).
@@ -468,6 +518,22 @@ def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fi
     for kind, chunk in _segment_runs(text):
         if kind == "t":
             for ch in chunk:
+                if inline:
+                    im = _inline_frame_for(inline, ch)
+                    if im is not None:
+                        h = max(1, int(emoji_px))
+                        w = _inline_advance(im, h)
+                        r = im if (im.width == w and im.height == h) else im.resize((w, h))
+                        top = int(y + max(0, (font.size if hasattr(font, "size") else emoji_px) - h))
+                        if r.mode in ("RGBA", "LA"):
+                            img.paste(r, (int(cx), top), mask=r.split()[-1])
+                        else:
+                            img.paste(r, (int(cx), top))
+                        cx += w
+                        continue
+                if _is_pua(ch):
+                    # ВНЕ `if inline` — см. комментарий в _runs_width.
+                    continue
                 if ch not in _EMOJI_SKIP and _EMOJI_RUN_RE.match(ch):
                     g = _emoji_glyph(ch, emoji_px)
                     if g is not None:
@@ -498,7 +564,8 @@ def _draw_runs(draw, img, x: float, y: float, text: str, font, emoji_px: int, fi
     return cx
 
 
-def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bold: bool = False) -> list[str]:
+def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bold: bool = False,
+               inline: dict | None = None) -> list[str]:
     """Word-wrap text → list of strings длиной до max_width pixels.
 
     Слова длиннее max_width бьются посимвольно — иначе строка
@@ -511,7 +578,7 @@ def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bol
     px = emoji_px if emoji_px is not None else (getattr(font, "size", 24) or 24)
 
     def _measure(s: str) -> float:
-        return _runs_width(_segment_runs(s), font, px, bold)
+        return _runs_width(_segment_runs(s), font, px, bold, inline)
 
     def _break_long(word: str) -> list[str]:
         parts, cur = [], ""
@@ -549,17 +616,18 @@ def _wrap_text(text: str, font, max_width: int, emoji_px: int | None = None, bol
     return lines
 
 
-def _circle_avatar(avatar_bytes: bytes):
+def _circle_avatar(avatar_bytes: bytes, size: int = AVATAR_SIZE):
     """Return PIL RGBA Image of circular-cropped avatar, or None on failure."""
     from PIL import Image, ImageDraw
     try:
+        size = max(16, int(size))
         av = Image.open(io.BytesIO(avatar_bytes))
         av = av.convert("RGBA").resize(
-            (AVATAR_SIZE, AVATAR_SIZE), Image.Resampling.LANCZOS
+            (size, size), Image.Resampling.LANCZOS
         )
-        mask = Image.new("L", (AVATAR_SIZE, AVATAR_SIZE), 0)
+        mask = Image.new("L", (size, size), 0)
         ImageDraw.Draw(mask).ellipse(
-            (0, 0, AVATAR_SIZE, AVATAR_SIZE), fill=255
+            (0, 0, size, size), fill=255
         )
         av.putalpha(mask)
         return av
@@ -608,6 +676,7 @@ def render_quote_png(
     avatar_bytes: bytes | None = None,
     timestamp: str = "",
     background_bytes: bytes | None = None,
+    inline_images: dict | None = None,
 ) -> bytes | None:
     """Render прямоугольной PNG-цитаты с avatar + bubble overlay.
 
@@ -620,6 +689,9 @@ def render_quote_png(
         timestamp: Строка даты (например, "2026-07-18 18:30") для info-блока.
         background_bytes: Фото из replied сообщения — используется как фон
             (cover-fit + blur + затемнение) вместо плоской заливки.
+        inline_images: ``{PUA-маркер: RGBA Image | [RGBA Image, ...]}`` —
+            кастомные (анимированные) эмодзи. Для статичного PNG берётся
+            первый кадр; анимация живёт в GIF-ветке (`anim_strips`).
 
     Returns:
         PNG bytes (RGB, не RGBA — для universal preview в Telegram).
@@ -707,7 +779,7 @@ def render_quote_png(
     right_text_w = right_w - 2 * BUBBLE_TEXT_PAD_X
     quoted = body_text
     body_lines = _wrap_text(quoted, body_font, max_width=right_text_w,
-                            emoji_px=BODY_FONT_SIZE)
+                            emoji_px=BODY_FONT_SIZE, inline=inline_images)
     if len(body_lines) > MAX_BODY_LINES:
         body_lines = body_lines[:MAX_BODY_LINES]
         if body_lines:
@@ -779,7 +851,8 @@ def render_quote_png(
         tx = right_x + BUBBLE_TEXT_PAD_X
         for line in body_lines:
             _draw_runs(draw, img, tx, cy + (_body_lh - BODY_FONT_SIZE) // 2,
-                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
+                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR,
+                       inline=inline_images)
             cy += _body_lh
 
     buf = io.BytesIO()
@@ -799,41 +872,59 @@ def render_info_strip_png(
     timestamp: str = "",
     body: str = "",
     width: int = STRIP_WIDTH,
+    inline_images: dict | None = None,
+    scale: float = 1.0,
 ) -> bytes | None:
     """Узкая вертикальная info-плашка для GIF-цитат: слева от кадров.
 
     Содержит avatar + имя + ID + username + дату + опциональный текст
     (подпись к видео/гифке). Высоту подгоняет `_stack_gif_side_by_side`
     под высоту видеокадра.
+
+    ``inline_images`` — те же PUA-маркеры, что и в `render_quote_png`;
+    для GIF-цитаты рендерится один кадр на фазу анимации (см. anim_strips).
+
+    ``scale`` — изотропный множитель разрешения (шрифты, аватар, отступы,
+    line-height). Плашка потом масштабируется под высоту кадра, поэтому её
+    выгодно рисовать с запасом: даунскейл текста чёткий, апскейл — каша.
+    ВАЖНО: масштабировать нужно ОБЕ оси — иначе плашка получит неверную
+    пропорцию (например 880×334 вместо 880×668) и в раскладке
+    `_gif_side_layout` «съест» вдвое больше ширины холста.
     """
     if not is_available():
         return None
 
     from PIL import Image, ImageDraw
 
+    sc = max(0.5, min(4.0, float(scale or 1.0)))
+
     sender_name_text = _strip_html(sender_name) or "(unknown)"
     unames = (usernames or [])[:2]
     timestamp_text = _strip_html(timestamp)
     body_text = _strip_html(body)
 
-    name_font = _resolve_font(NAME_FONT_SIZE, sender_name_text)
-    info_font = _resolve_font(INFO_FONT_SIZE, "ID")
-    body_font = _resolve_font(BODY_FONT_SIZE, body_text)
+    name_px = max(8, int(NAME_FONT_SIZE * sc))
+    info_px = max(8, int(INFO_FONT_SIZE * sc))
+    body_px = max(8, int(BODY_FONT_SIZE * sc))
+    name_font = _resolve_font(name_px, sender_name_text)
+    info_font = _resolve_font(info_px, "ID")
+    body_font = _resolve_font(body_px, body_text)
     if not (name_font and info_font and body_font):
         return None
 
-    pad = 36
+    pad = max(8, int(36 * sc))
+    avatar_size = max(24, int(AVATAR_SIZE * sc))
     text_w = width - 2 * pad
-    gap = int(HEADER_TO_BUBBLE_GAP * VERTICAL_SCALE)
-    name_lh = NAME_LINE_HEIGHT
-    info_lh = INFO_LINE_HEIGHT
-    body_lh = BODY_LINE_HEIGHT
+    gap = int(HEADER_TO_BUBBLE_GAP * VERTICAL_SCALE * sc)
+    name_lh = max(1, int(NAME_LINE_HEIGHT * sc))
+    info_lh = max(1, int(INFO_LINE_HEIGHT * sc))
+    body_lh = max(1, int(BODY_LINE_HEIGHT * sc))
 
-    avatar_img = _circle_avatar(avatar_bytes) if avatar_bytes else None
+    avatar_img = _circle_avatar(avatar_bytes, size=avatar_size) if avatar_bytes else None
 
     name_lines = (
         _wrap_text(sender_name_text, name_font, max_width=text_w,
-                   emoji_px=NAME_FONT_SIZE, bold=True)
+                   emoji_px=name_px, bold=True)
         or [sender_name_text]
     )
     info_items: list[str] = []
@@ -847,11 +938,11 @@ def render_info_strip_png(
     for item in info_items:
         info_lines.extend(
             _wrap_text(item, info_font, max_width=text_w,
-                       emoji_px=INFO_FONT_SIZE) or [item]
+                       emoji_px=info_px) or [item]
         )
     quoted = body_text
     body_lines = _wrap_text(quoted, body_font, max_width=text_w,
-                            emoji_px=BODY_FONT_SIZE)
+                            emoji_px=body_px, inline=inline_images)
     if len(body_lines) > MAX_BODY_LINES:
         body_lines = body_lines[:MAX_BODY_LINES]
         if body_lines:
@@ -859,13 +950,13 @@ def render_info_strip_png(
 
     h = pad
     if avatar_img is not None:
-        h += AVATAR_SIZE + gap // 2
+        h += avatar_size + gap // 2
     h += len(name_lines) * name_lh + gap // 2 + len(info_lines) * info_lh
     if body_lines:
         h += gap // 2 + len(body_lines) * body_lh
     h += pad
 
-    img = Image.new("RGB", (width, max(h, 320)), color=BG_COLOR)
+    img = Image.new("RGB", (width, max(h, int(320 * sc))), color=BG_COLOR)
     draw = ImageDraw.Draw(img)
     y = pad
     if avatar_img is not None:
@@ -873,21 +964,24 @@ def render_info_strip_png(
             img.paste(avatar_img, (pad, y), mask=avatar_img.split()[3])
         except Exception:
             img.paste(avatar_img.convert("RGB"), (pad, y))
-        y += AVATAR_SIZE + gap // 2
+        y += avatar_size + gap // 2
     for line in name_lines:
-        _draw_runs(draw, img, pad, y + (name_lh - NAME_FONT_SIZE) // 2,
-                   line, name_font, NAME_FONT_SIZE, NAME_COLOR, bold=True)
+        _draw_runs(draw, img, pad, y + (name_lh - name_px) // 2,
+                   line, name_font, name_px, NAME_COLOR, bold=True,
+                   inline=inline_images)
         y += name_lh
     y += gap // 2
     for line in info_lines:
-        _draw_runs(draw, img, pad, y + (info_lh - INFO_FONT_SIZE) // 2,
-                   line, info_font, INFO_FONT_SIZE, INFO_COLOR)
+        _draw_runs(draw, img, pad, y + (info_lh - info_px) // 2,
+                   line, info_font, info_px, INFO_COLOR,
+                   inline=inline_images)
         y += info_lh
     if body_lines:
         y += gap // 2
         for line in body_lines:
-            _draw_runs(draw, img, pad, y + (body_lh - BODY_FONT_SIZE) // 2,
-                       line, body_font, BODY_FONT_SIZE, TEXT_COLOR)
+            _draw_runs(draw, img, pad, y + (body_lh - body_px) // 2,
+                       line, body_font, body_px, TEXT_COLOR,
+                       inline=inline_images)
             y += body_lh
 
     buf = io.BytesIO()
@@ -920,53 +1014,299 @@ def _as_gif_direct(data: bytes) -> bytes | None:
         return None
 
 
-def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40,
-                            max_width: int = 800) -> bytes | None:
-    """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами.
+# Геометрия GIF-цитаты. Плашка занимает фиксированную долю ширины холста и
+# центрируется по вертикали; остальное место — под кадр. Так кружок 200×200
+# растягивается на ~60% ширины цитаты (раньше жёсткий лимит «не более 2x»
+# оставлял его 400px в холсте 926px — цитата выглядела мелкой и «чёрной»,
+# т.к. круг занимал меньше половины кадра).
+GIF_STRIP_SHARE = 0.40      # доля ширины холста под info-плашку
+GIF_MAX_UPSCALE = 3.5       # больше не растим: 200px кружок → каша
+GIF_MAX_HEIGHT = 820       # потолок высоты холста (иначе портреты огромны)
+# МЯГКИЙ потолок веса. Жёсткий лимит — MAX_QUOTE_GIF_BYTES (12МБ), но держаться
+# впритык к нему опасно: любое чуть более шумное видео его пробивает, и цитата
+# молча уходит на статичную карточку с заглушкой. Реальный кейс: видео-цитата
+# весила 12.2МБ из 12.6МБ — 97% лимита.
+GIF_SOFT_BYTES = 6 * 1024 * 1024
+GIF_MIN_HEIGHT = 200
+# Потолок длительности одного цикла GIF-цитаты. Кружки бывают на 60 с;
+# без потолка GIF крутился бы минуту, поэтому длинные ролики прореживаются
+# сильнее (но остаются в пределах разумного).
+GIF_MAX_LOOP_MS = 20_000
+# Сколько из 256 цветов палитры резервируем под info-плашку. Без резерва
+# насыщенное видео (кружок с зелёно-оранжевым фоном) забирало всю палитру,
+# и серо-синий текст NAME_COLOR/INFO_COLOR маппился на оранжевый.
+GIF_STRIP_PALETTE_COLORS = 64
 
-    Качество:
-    - мелкие кадры апскейлятся (lanczos, до max_width и не более 2x) —
-      итог заметно больше исходной гифки;
-    - ОДНА общая 256-палитра на все кадры (MEDIANCUT по монтаж-тамбнейлам +
-      FLOYDSTEINBERG): без этого покадровые палитры дают грязь и мерцание.
+
+def _split_palette(canvases: list, strip_w: int, strip_colors: int) -> Any:
+    """Палитра GIF: первые N цветов — из info-плашки, остальные — из видео.
+
+    Без разделения MEDIANCUT по общему монтажу отдавал все 256 цветов
+    насыщенному кадру, и текст цитаты менял цвет на глазах у юзера.
+    Плашка статична, поэтому её палитру можно построить один раз и
+    зафиксировать; видео дизерится в оставшиеся слоты.
     """
-    from PIL import Image, ImageSequence
+    from PIL import Image
+    n_strip = max(8, min(200, int(strip_colors)))
+    n_video = 256 - n_strip
 
-    gif = Image.open(io.BytesIO(gif_bytes))
-    strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
-    canvases: list = []
-    durations: list[int] = []
-    for i, frame in enumerate(ImageSequence.Iterator(gif)):
-        if i >= max_frames:
-            break
-        dur = int(frame.info.get("duration", 100)) or 100
-        fr = frame.convert("RGB")
-        w, h = fr.size
-        if w < max_width:
-            s = min(max_width / max(w, 1), 2.0)
-            fr = fr.resize((max(1, int(w * s)), max(1, int(h * s))), Image.LANCZOS)
-            w, h = fr.size
-        strip_w = max(1, int(strip.width * h / max(strip.height, 1)))
-        strip_small = strip.resize((strip_w, h))
-        canvas = Image.new("RGB", (strip_w + w, h), color=(0, 0, 0))
-        canvas.paste(strip_small, (0, 0))
-        canvas.paste(fr, (strip_w, 0))
-        canvases.append(canvas)
-        durations.append(dur)
-    if len(canvases) < 2:
-        return None
-    # Общая палитра: монтаж ужатых копий → MEDIANCUT → один набор цветов.
+    # 1) Палитра плашки — по её собственному куску из первого кадра.
+    strip_sample = canvases[0].crop((0, 0, max(1, strip_w), canvases[0].height))
+    strip_pal = strip_sample.quantize(colors=n_strip, method=Image.MEDIANCUT)
+    strip_rgb = (strip_pal.getpalette() or [])[: n_strip * 3]
+
+    # 2) Палитра видео — по монтажу тамбнейлов (иначе мерцание).
     thumbs = []
     for c in canvases:
-        t = c.copy()
+        t = c.crop((strip_w, 0, c.width, c.height))
+        if t.width < 1 or t.height < 1:
+            t = c.copy()
         t.thumbnail((160, 160))
         thumbs.append(t)
-    montage = Image.new("RGB", (sum(t.width for t in thumbs), max(t.height for t in thumbs)))
+    montage = Image.new(
+        "RGB",
+        (max(1, sum(t.width for t in thumbs)), max(t.height for t in thumbs)),
+        (0, 0, 0),
+    )
     x = 0
     for t in thumbs:
         montage.paste(t, (x, 0))
         x += t.width
-    palette_img = montage.quantize(colors=256, method=Image.MEDIANCUT)
+    video_pal = montage.quantize(colors=n_video, method=Image.MEDIANCUT)
+    video_rgb = (video_pal.getpalette() or [])[: n_video * 3]
+
+    # 3) Склеиваем: слоты плашки фиксированы, хвост добирает видео.
+    palette = list(strip_rgb)
+    palette += list(video_rgb)
+    palette = palette[: 256 * 3]
+    palette += [0] * (256 * 3 - len(palette))
+    combined = Image.new("P", (1, 1))
+    combined.putpalette(palette)
+    return combined
+
+
+def _gif_side_layout(video_size, strip_size, target_width: int,
+                     max_upscale: float, max_width: int) -> dict:
+    """Раскладка кадра и плашки для GIF-цитаты. Pure.
+
+    Плашка занимает левую часть и **растягивается на всю высоту холста**
+    (иначе она «висит» узкой полосой в чёрном поле). Высота холста
+    подбирается так, чтобы суммарная ширина вышла на ``target_width``:
+
+        H * (sw0/sh0 + vw0/vh0) = target_width
+
+    откуда ``H = target_width / (sw0/sh0 + vw0/vh0)``. Далее апскейл кадра
+    ограничен ``max_upscale`` — иначе кружок 200×200 превратится в кашу.
+
+    Возвращает ``{'video': (w,h), 'strip_w', 'strip_h', 'strip_y', 'canvas'}``.
+    """
+    vw0, vh0 = video_size
+    sw0, sh0 = strip_size
+    vw0, vh0 = max(1, int(vw0)), max(1, int(vh0))
+    sw0, sh0 = max(1, int(sw0)), max(1, int(sh0))
+    target_width = max(320, int(target_width))
+
+    strip_ratio = sw0 / sh0
+    video_ratio = vw0 / vh0
+    denom = strip_ratio + video_ratio
+    H = int(target_width / denom) if denom > 0 else vh0
+    # Апскейл кадра не выше max_upscale (200px кружок → 700px, не 1400).
+    H = min(H, int(vh0 * max_upscale))
+    H = max(H, GIF_MIN_HEIGHT)
+    # Потолок высоты холста (иначе портретное видео даёт 3000px по высоте).
+    if H > GIF_MAX_HEIGHT:
+        H = GIF_MAX_HEIGHT
+    # Ширина кадра по построению ≤ target_width (H выведен из неё), поэтому
+    # отдельного клампа по max_width здесь не нужно: max_upscale и
+    # GIF_MAX_HEIGHT уже ограничивают раздувание.
+
+    video_w = max(1, int(video_ratio * H))
+    strip_w = max(1, int(strip_ratio * H))
+    return {
+        "video": (video_w, H),
+        "strip_w": strip_w,
+        "strip_h": H,
+        "strip_y": 0,
+        "canvas": (strip_w + video_w, H),
+    }
+
+
+def _sample_plan(total: int, max_frames: int) -> tuple[set | None, float]:
+    """(индексы_кадров, шаг_прореживания) для выборки из total кадров.
+
+    Равномерная выборка вместо «первых N» — иначе длинное видео (кружок до
+    60 с) показывается только с начала. Возвращает ``(None, 1.0)``, если
+    прореживать не нужно.
+
+    Шаг отдаётся, чтобы длительности кадров домножить на него: иначе
+    прореженная GIF играет в разы быстрее оригинала (30-секундный кружок
+    прокрутился бы за 13 с).
+    """
+    if total <= 0 or total <= max_frames:
+        return None, 1.0
+    k = max(2, max_frames)
+    idxs = {round(i * (total - 1) / (k - 1)) for i in range(k)}
+    return idxs, total / max(1, len(idxs))
+
+
+def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40,
+                            max_width: int = 800, anim_strips: list | None = None,
+                            anim_duration_ms: int = 0, circle: bool = False,
+                            target_width: int | None = None) -> bytes | None:
+    """Публичная обёртка: при превышении лимита — деградация по плану.
+
+    GIF-цитата кружка может весить несколько МБ (дизеринг + 700px кадр), и на
+    «шумном» клипе лимит 12MB пробивался — раньше это молча уводило цитату на
+    статичную карточку с заглушкой «Видеосообщение».
+
+    Порядок деградации важен. Сначала режем число кадров, но НЕ до конца:
+    на насыщенном клипе так доходило до 2 кадров, то есть не анимация.
+    Поэтому дальше уменьшаем размер холста, сохраняя и кадры, и движение —
+    для кружка это куда приятнее, чем два неподвижных кадра.
+    """
+    plan = (
+        (max_frames, 1.00),
+        (max_frames // 2, 1.00),
+        (max_frames // 2, 0.85),
+        (max(4, max_frames // 3), 0.70),
+        (max(4, max_frames // 4), 0.60),
+        (max(4, max_frames // 5), 0.50),
+        (max(3, max_frames // 8), 0.40),
+    )
+    seen: set = set()
+    for frames, wscale in plan:
+        if frames < 2 or (frames, wscale) in seen:
+            continue
+        seen.add((frames, wscale))
+        tw = None
+        if wscale != 1.0:
+            tw = int((target_width or WIDTH) * wscale)
+        out = _stack_gif_once(
+            gif_bytes, strip_png, frames, max_width,
+            anim_strips, anim_duration_ms, circle, tw,
+        )
+        if out is not None:
+            if (frames, wscale) != (max_frames, 1.00):
+                logger.debug(
+                    "quote gif: в лимит уложились за счёт frames=%s width×%s",
+                    frames, wscale)
+            return out
+    return None
+
+
+def _stack_gif_once(gif_bytes: bytes, strip_png: bytes, max_frames: int = 40,
+                            max_width: int = 800, anim_strips: list | None = None,
+                            anim_duration_ms: int = 0, circle: bool = False,
+                            target_width: int | None = None) -> bytes | None:
+    """Кадры GIF справа + info-плашка слева. Pure (Pillow) — покрыто тестами.
+
+    Геометрия (важно для кружков):
+    - размер кадра подбирается так, чтобы ШИРИНА холста вышла на
+      ``target_width`` (по умолчанию WIDTH=1400, как у PNG-карточки) —
+      иначе GIF-цитата кружка выходит ~900px и в чате выглядит мелкой;
+    - апскейл ограничен ``max_upscale`` (3.5x): кружок в Telegram 200×200,
+      раздувать его сильнее — каша, но и оставлять 2× (как раньше) — тоже
+      мало: круг занимал лишь треть ширины цитаты;
+    - если исходник крупный — только ужимаем до target_width, не растим.
+
+    Качество:
+    - ОДНА общая 256-палитра на все кадры (MEDIANCUT по монтаж-тамбнейлам +
+      FLOYDSTEINBERG): без этого покадровые палитры дают грязь и мерцание.
+
+    ``anim_strips`` / ``anim_duration_ms`` — анимация custom-эмодзи: список
+    info-плашек по фазам (равномерно по циклу эмодзи) и полная длительность
+    цикла в мс. Каждый кадр берёт фазу по накопленному времени, поэтому
+    эмодзи в тексте анимируется синхронно с гифкой справа.
+
+    ``circle`` — наложить круглую альфа-маску (для кружков video_note:
+    Telegram отдаёт их квадратом и рисует круг в клиенте).
+    """
+    from PIL import Image, ImageSequence
+
+    gif = Image.open(io.BytesIO(gif_bytes))
+    base_strip = Image.open(io.BytesIO(strip_png)).convert("RGB")
+    layout = None
+    phase_strips: list = []
+    if anim_strips and anim_duration_ms > 0:
+        for s in anim_strips:
+            try:
+                phase_strips.append(Image.open(io.BytesIO(s)).convert("RGB"))
+            except Exception:
+                pass
+        if not phase_strips:
+            anim_duration_ms = 0
+    canvases: list = []
+    durations: list[int] = []
+    t_cum = 0
+    # Кадры > max_frames берём РАВНОМЕРНО по всей длительности, а не первые N.
+    # Иначе 60-секундный кружок показывал только первые ~3 секунды
+    # («берётся только начало»), хотя длительность цитаты это позволяла.
+    try:
+        _total = int(getattr(gif, "n_frames", 0) or 0)
+    except Exception:
+        _total = 0
+    wanted, stride = _sample_plan(_total, max_frames)
+    for i, frame in enumerate(ImageSequence.Iterator(gif)):
+        if wanted is not None and i not in wanted:
+            continue
+        dur = int(frame.info.get("duration", 100)) or 100
+        strip = base_strip
+        if phase_strips:
+            ph = int((t_cum % anim_duration_ms) / anim_duration_ms * len(phase_strips))
+            strip = phase_strips[min(ph, len(phase_strips) - 1)]
+        t_cum += dur
+        fr = frame.convert("RGB")
+        if circle:
+            # Круглая маска применяется ДО апскейла: маска строится под
+            # исходный размер кадра, поэтому её не нужно строить на 700px.
+            try:
+                from utils.gif_converter import apply_circle_mask
+                masked = apply_circle_mask(fr)
+                if masked is not None:
+                    # Кадр оставляем RGBA, чтобы углы были прозрачными; фон
+                    # под ними — тёмный, как у полосы слева.
+                    fr = masked
+            except Exception as e:
+                logger.debug(f"_stack_gif_side_by_side: circle mask failed: {e}")
+                fr = frame.convert("RGB")
+        if layout is None:
+            # Геометрия считается один раз по первому кадру: кадры одного
+            # клипа одной формы, а пересчёт в каждом кадре — лишняя работа.
+            layout = _gif_side_layout(
+                fr.size, base_strip.size,
+                target_width or WIDTH, GIF_MAX_UPSCALE, max_width,
+            )
+        w, h = layout["video"]
+        if fr.size != (w, h):
+            fr = fr.resize((w, h), Image.LANCZOS)
+        strip_w = layout["strip_w"]
+        strip_small = strip.resize((strip_w, layout["strip_h"]), Image.LANCZOS)
+        strip_y = layout["strip_y"]
+        if fr.mode in ("RGBA", "LA"):
+            # Композит через альфа: круг вырезан, углы = цвет плашки/фона.
+            # Холст обязан быть шириной strip_w + w, иначе alpha_composite
+            # молча обрежет кадр по правому краю (все кадры станут идентичными).
+            canvas = Image.new("RGBA", (strip_w + w, h), color=(0, 0, 0, 255))
+            canvas.paste(strip_small, (0, strip_y))
+            canvas.alpha_composite(fr, (strip_w, 0))
+            canvas = canvas.convert("RGB")
+        else:
+            canvas = Image.new("RGB", (strip_w + w, h), color=(0, 0, 0))
+            canvas.paste(strip_small, (0, strip_y))
+            canvas.paste(fr, (strip_w, 0))
+        canvases.append(canvas)
+        durations.append(dur)
+    if len(canvases) < 2:
+        return None
+    # Длительности домножаем на шаг прореживания → цитата играет в реальном
+    # темпе. Потолок цикла: 60-секундный кружок не должен крутиться минуту.
+    if stride > 1.01:
+        durations = [max(20, int(d * stride)) for d in durations]
+    total_ms = sum(durations)
+    if total_ms > GIF_MAX_LOOP_MS:
+        k = GIF_MAX_LOOP_MS / float(total_ms)
+        durations = [max(20, int(d * k)) for d in durations]
+    palette_img = _split_palette(canvases, strip_w, GIF_STRIP_PALETTE_COLORS)
     frames = [c.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG) for c in canvases]
     buf = io.BytesIO()
     frames[0].save(
@@ -974,6 +1314,15 @@ def _stack_gif_side_by_side(gif_bytes: bytes, strip_png: bytes, max_frames: int 
         duration=durations, loop=0,
     )
     out = buf.getvalue()
+    if len(out) > GIF_SOFT_BYTES:
+        # Мягкий лимит: файл технически влезает в Telegram, но 12МБ на 40 кадров
+        # — это долгая загрузка превью и ноль запаса до жёсткого лимита.
+        # Реальный кейс: видео-цитата весила 12.2МБ из 12.6МБ (97%).
+        # None → вызывающий уменьшает кадры и/или холст по плану деградации.
+        logger.debug(
+            "quote gif: %.1fMB > soft %.1fMB — деградируем",
+            len(out) / 1e6, GIF_SOFT_BYTES / 1e6)
+        return None
     if len(out) > MAX_QUOTE_GIF_BYTES:
         return None
     return out
@@ -1020,14 +1369,28 @@ async def render_video_quote_gif(
     max_width: int = 800,
     max_frames: int = 40,
     fps: int = 12,
-    duration_s: float = 4.0,
-    timeout_s: float = 60.0,
+    duration_s: float = 90.0,
+    timeout_s: float = 90.0,
+    anim_strips: list | None = None,
+    anim_duration_ms: int = 0,
+    circle: bool = False,
+    target_width: int | None = None,
 ) -> bytes | None:
-    """Видео/гифка из реплая справа + info-плашка слева → анимированная GIF.
+    """Видео/гифка/кружок из реплая справа + info-плашка слева → GIF.
 
     Если bytes уже GIF (реплай-гифка) — кадры берутся напрямую через Pillow
-    без ffmpeg. Видео (mp4) конвертируются через ffmpeg, если он есть.
-    Кружки (video_note) сюда не доходят — только статичная карточка.
+    без ffmpeg. Видео (mp4) и кружки (video_note, квадратный mp4) идут
+    через ffmpeg; для кружков дополнительно ставится ``circle=True``, чтобы
+    результат выглядел круглым, а не квадратным (круг рисует клиент).
+
+    ``anim_strips``/``anim_duration_ms`` — фазы анимации custom-эмодзи в
+    тексте (см. `_stack_gif_side_by_side`).
+
+    ``duration_s`` — ТЕПЕРЬ только верхняя граница окна, а не точная длина:
+    при ``fit_frames`` fps подбирается под реальную длительность клипа
+    (``video_to_gif_bytes``), а лишние кадры равномерно прореживает
+    `_even_frame_indices`. Так 60-секундный кружок показывается целиком,
+    а не только первые 4 секунды.
 
     Returns None если нет кадров / encode упал / итог тяжелее лимита —
     caller падает на статичную PNG-цитату.
@@ -1044,6 +1407,7 @@ async def render_video_quote_gif(
                 max_fps=fps,
                 max_width=max_width,
                 timeout_s=timeout_s,
+                fit_frames=max_frames,
             )
         except Exception:
             return None
@@ -1053,6 +1417,6 @@ async def render_video_quote_gif(
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None, _stack_gif_side_by_side, gif, card_png_bytes, max_frames,
-            max_width)
+            max_width, anim_strips, anim_duration_ms, circle, target_width)
     except Exception:
         return None

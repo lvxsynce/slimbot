@@ -4,3 +4,8 @@ aiohttp>=3.9.0
 dnspython>=2.6.0
 python-dotenv>=1.0.0
 Pillow>=10.0.0
+# Растеризация TGS (Lottie) в RGBA-кадры для анимированных custom emoji.
+# Ставится abi3-колесом (cp37-abi3-manylinux) — без компиляции и apt-зависимостей.
+# Опционален: utils/quote_image.py::_tgs_frames импортирует его лениво и молча
+# падает на статичный глиф, если пакет не установлен.
+rlottie-python[full]>=1.3.0
