@@ -37,13 +37,42 @@ except ImportError:
 # ----------------- helpers -----------------
 
 def _int_env(name: str, default: int) -> int:
-    """Читает int из env (fallback — строковый default)."""
-    return int(os.getenv(name, str(default)))
+    """Читает int из env.
+
+    Пустое или мусорное значение → `default`, а НЕ исключение. Так
+    требует Heroku-модель: переменная может быть не задана вовсе или
+    задана пустой строкой (`FOO=` в `.env`, `heroku config:unset`),
+    и падать на импорте из-за этого нельзя — бот обязан стартовать и
+    сказать про недостающие секреты в WARNING (`_check_secrets`).
+    """
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except (TypeError, ValueError):
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "%s=%r не число — беру дефолт %r", name, raw, default
+        )
+        return default
 
 
 def _float_env(name: str, default: float) -> float:
-    """Читает float из env (fallback — строковый default)."""
-    return float(os.getenv(name, str(default)))
+    """Читает float из env; пустое/мусорное значение → `default`."""
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except (TypeError, ValueError):
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "%s=%r не число — беру дефолт %r", name, raw, default
+        )
+        return default
 
 
 # ----------------- Tier 1: Secrets -----------------
@@ -54,8 +83,9 @@ TOKEN = os.getenv("TOKEN", "")
 # ENV: API_ID / API_HASH — Telethon креды (my.telegram.org).
 API_ID = _int_env("API_ID", 0)
 API_HASH = os.getenv("API_HASH", "")
-# Fixed AI backend. Values are configured in `.env` and are not user-switchable.
-AI_API_KEY = os.getenv("AI_API_KEY_WILLOW", "").strip()
+# Fixed AI backend (ddt-прокси). Values live in `.env` and are not
+# user-switchable — см. Tier 2 (`AI_URL`).
+AI_API_KEY = os.getenv("AI_API_KEY_DDT", "").strip()
 
 
 def _check_secrets() -> None:
@@ -68,7 +98,7 @@ def _check_secrets() -> None:
     if not API_HASH:
         issues.append("API_HASH")
     if not AI_API_KEY:
-        issues.append("AI_API_KEY_WILLOW")
+        issues.append("AI_API_KEY_DDT")
     if issues:
         import logging
         logging.getLogger(__name__).warning(
@@ -83,10 +113,37 @@ LLM_TIMEOUT = _int_env("LLM_TIMEOUT", 60)
 LLM_TEMPERATURE = _float_env("LLM_TEMPERATURE", 0.5)
 LLM_MAX_TOKENS = _int_env("LLM_MAX_TOKENS", 4000)
 
-# Fixed backend settings for `.ии` and AI translation.
-AI_URL = os.getenv("WILLOW_CHAT_URL", "https://api.willowapi.digital/v1/chat/completions")
-AI_MODEL = os.getenv("WILLOW_MODEL", "gpt-5.6-luna")
-AI_REASONING_EFFORT = os.getenv("WILLOW_REASONING_EFFORT", "low")
+# ----------------- Tier 2: LLM backend (ddt-прокси) -----------------
+#
+# Прокси отдаёт OpenAI-совместимый `/v1/chat/completions`. Два отличия
+# от обычного OpenAI-эндпоинта:
+#   * заголовок `X-DDT-Group` — приоритет группы, а НЕ фильтр: если в
+#     группе нет ключа под запрошенную модель, запрос уйдёт в другую
+#     группу. Опечатка в имени группы не ошибка (её просто игнорируют);
+#   * `max_retries = 0` — ретраи делает сам прокси, клиентские ретраи
+#     только жгут лимиты.
+#
+# ⚠️ Прокси слушает HTTP без TLS на порту, открытом в интернет: токен
+# виден в сети. Держать на свой страх и риск или закрыть nginx'ом на
+# 443 с TLS (тогда меняется только `AI_URL`).
+AI_URL = os.getenv(
+    "AI_API_URL_DDT", "http://31.77.19.35:8899/v1"
+).rstrip("/") + "/chat/completions"
+#: Заголовок `X-DDT-Group`. Пусто → не отправляем, прокси возьмёт дефолт.
+AI_GROUP = os.getenv("AI_GROUP_DDT", "").strip()
+
+#: Основная модель и запасная. Фолбэк срабатывает на сетевых ошибках и
+#: 5xx: если основная группа/ключ легла, запрос идёт ко второй модели.
+AI_MODEL = os.getenv("AI_MODEL_DDT", "gemini-3.8-flash")
+AI_MODEL_FALLBACK = os.getenv("AI_MODEL_DDT_FALLBACK", "gpt-6.1-sol")
+#: Сколько моделей пробовать по кругу: 2 = основная + один фолбэк.
+AI_MODEL_ATTEMPTS = max(1, min(3, _int_env("AI_MODEL_ATTEMPTS", 2)))
+#: Reasoning-модели (gpt-*) принимают `reasoning_effort`. Для gemini
+#: поле не нужно и прокси его не любит, поэтому по умолчанию пусто.
+AI_REASONING_EFFORT = os.getenv("AI_REASONING_EFFORT", "").strip()
+
+#: Показывать подпись модели в ответе `.ии` (неизвестно, какая ответила).
+AI_SHOW_MODEL = os.getenv("AI_SHOW_MODEL", "1") != "0"
 
 # ipinfo.io — geo/ASN по IP.
 IPINFO_URL_TEMPLATE = os.getenv("IPINFO_URL_TEMPLATE", "https://ipinfo.io/{ip}/json")

@@ -17,9 +17,27 @@ import pytest
 from aiogram.dispatcher.event.bases import SkipHandler
 
 import handlers.commands as C
+from utils import storage as mod
 from utils.storage import session_exists, user_sessions
 
 NO_SESSION_UID = 111111111  # гарантированно нет в user_sessions.json
+
+
+def _fake_session(monkeypatch, uid: int = 999222333) -> int:
+    """Завести сессию для `uid` и вернуть его id.
+
+    `session_exists` смотрит и в реестр, и в файл `.session`, поэтому
+    подменяем функцию целиком — в том числе на самом `handlers.commands`,
+    который импортировал её по имени (`from utils.storage import
+    session_exists`), иначе подмена в `utils.storage` не сработает.
+
+    Тест не должен зависеть от того, есть ли реальная сессия на машине,
+    где прогоняются тесты.
+    """
+    monkeypatch.setattr(mod, "session_exists", lambda _uid: str(_uid) == str(uid))
+    monkeypatch.setattr(mod, "user_sessions", {str(uid): {"status": "active"}})
+    monkeypatch.setattr(C, "session_exists", lambda _uid: str(_uid) == str(uid))
+    return uid
 
 
 class FakeUser:
@@ -44,12 +62,17 @@ class FakeMessage:
 
 
 def _matches_ignore_unauthorized(msg) -> bool:
-    """Дублирует фильтр хендлера — если он разъедется, тест упадёт."""
+    """Дублирует фильтр хендлера — если он разъедется, тест упадёт.
+
+    `session_exists` берём с самого `handlers.commands`: он импортировал
+    её по имени, и подмена в `utils.storage` на этот модуль не влияет.
+    """
+    exists = getattr(C, "session_exists", session_exists)
     return bool(
         C._is_dot(msg.text)
         and not C._bypass(msg.text)
         and not C._is_help_request(msg.text)
-        and (not msg.from_user or not session_exists(str(msg.from_user.id)))
+        and (not msg.from_user or not exists(str(msg.from_user.id)))
     )
 
 
@@ -98,11 +121,15 @@ def test_real_commands_are_not_swallowed_for_user_without_session(text):
     assert not msg.replies
 
 
-def test_fallback_does_not_swallow_with_session_either():
-    """С сессией фильтр не совпадает вовсе — значит, fallback не участвует."""
-    uid = int(next(iter(user_sessions)))
-    if not session_exists(str(uid)):
-        pytest.skip("нет активной сессии в user_sessions.json")
+def test_fallback_does_not_swallow_with_session_either(monkeypatch):
+    """С сессией фильтр не совпадает вовсе — значит, fallback не участвует.
+
+    Раньше тест брал первую сессию из `user_sessions.json`, то есть зависел
+    от боевого состояния и молча пропускался на чистой машине. Теперь
+    сессия заводятся прямо в тесте — фикстура `session` вместо чтения
+    прод-файла.
+    """
+    uid = _fake_session(monkeypatch)
     for text in (".ping", ".time", ".love"):
         msg = FakeMessage(text, uid)
         assert not _matches_ignore_unauthorized(msg), f"{text!r} must not match fallback"
@@ -157,10 +184,8 @@ def test_suggest_unknown_private_raises_skip_for_user_without_session():
         asyncio.run(C.suggest_unknown_private(msg))
 
 
-def test_suggest_unknown_private_answers_for_user_with_session():
-    uid = int(next(iter(user_sessions)))
-    if not session_exists(str(uid)):
-        pytest.skip("нет активной сессии в user_sessions.json")
+def test_suggest_unknown_private_answers_for_user_with_session(monkeypatch):
+    uid = _fake_session(monkeypatch)
     msg = FakeMessage(".pingn", uid)
     asyncio.run(C.suggest_unknown_private(msg))
     assert msg.replies, "expected a suggestion reply for a connected user"

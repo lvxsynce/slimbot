@@ -1,4 +1,4 @@
-"""Команда .ии <запрос> — ИИ-ассистент на Willow gpt-5.6-luna (low effort).
+"""Команда .ии <запрос> — ИИ-ассистент (модель из конфига, подпись в футере).
 
 Capabilities:
 - .ии запрос          → ответ с памятью диалога (ai_memory)
@@ -48,6 +48,7 @@ from config import (
     AI_TOOL_OUTPUT_MAX_CHARS,
     AI_CONTEXT_LEN_DEFAULT,
     AI_CONTEXT_LEN_MAX,
+    AI_SHOW_MODEL,
     TELETHON_RESOLVE_TIMEOUT,
     AI_REQUEST_LIMIT,
     AI_REQUEST_WINDOW,
@@ -458,6 +459,16 @@ def _format_ai_response(
         hints.append(fmt_footer_tools(used_tools))
     if usage and (usage.get("input_tokens") or usage.get("output_tokens")):
         hints.append(fmt_footer_usage(usage))
+    # Подпись модели. Нужна потому, что у ddt-прокси `X-DDT-Group` —
+    # приоритет, а не фильтр: запрос с `gemini-3.8-flash` при группе
+    # `GPT Plus` уходит в другую группу, и по настройкам нельзя понять,
+    # кто ответил. Поэтому берём `model` из тела ответа.
+    #
+    # Форматируется здесь, а не в `utils/ai_prompts.py`: это единственное
+    # место, где собирается футер `.ии`, и логика подписи принадлежит
+    # ей, а не общему слою промптов.
+    if AI_SHOW_MODEL and usage and usage.get("model"):
+        hints.append(f"модель: {usage['model']}")
 
     # Keep the header outside the quote, like .ping and .calc.
     header_line = "<b>Slim bot | AI</b>"
@@ -971,7 +982,7 @@ async def _llm_iterate(
     tool_log: list[tuple[str, str, str, int]] = []
     answer: str | None = None
     err: str | None = None
-    total_usage = {"input_tokens": 0, "output_tokens": 0, "seconds": 0.0}
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "seconds": 0.0, "model": ""}
 
     for iteration in range(max_iter + 1):
         answer, err, usage = await ask(
@@ -979,8 +990,12 @@ async def _llm_iterate(
             include_user_message=False,
             return_usage=True,
         )
-        for key in total_usage:
+        # Токены и время суммируем, а модель НЕ суммируем: в tool-loop
+        # каждый раунд может уйти на другую (фолбэк), и в подписи нужна
+        # та, что ответила последней — именно она определяет результат.
+        for key in ("input_tokens", "output_tokens", "seconds"):
             total_usage[key] += usage.get(key, 0)
+        total_usage["model"] = usage.get("model", "")
         if err:
             return None, tool_log, err, total_usage
         calls = _extract_tool_calls(answer)

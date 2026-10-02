@@ -5,6 +5,36 @@
 > `utils/cmds.py` и `handlers/commands/_helpdb.py`, упоминаемые модули.
 > Правя код — правь и этот файл.
 
+## Где живут секреты
+
+По модели **Heroku config vars**: то, что меняется между деплоями и
+содержит секреты, лежит в окружении, а не в репозитории.
+
+| Где | Что | Права |
+|---|---|---|
+| `/etc/slimbot/secrets.env` | боевые секреты и per-deploy настройки | `600`, `root:root` |
+| `/etc/systemd/system/slimbot.service.d/override.conf` | `EnvironmentFile=/etc/slimbot/secrets.env` | — |
+| `.env` в корне | **только локальная разработка**, пустые значения | `600`, в `.gitignore` |
+| `.env.example` | шаблон с пустыми значениями | в репозитории |
+| `config.py` | только чтение `os.getenv` и дефолты | в репозитории |
+
+`tests/conftest.py` задаёт фиктивные значения **до** импорта `config`,
+поэтому тесты не требуют ни боевых ключей, ни `.env`.
+
+Правила:
+
+* `_int_env`/`_float_env` на пустое или мусорное значение берут дефолт, а
+  не падают: переменную можно не задать или снять (`heroku config:unset`
+  тоже оставляет её пустой);
+* недостающие секреты — WARNING на старте (`_check_secrets`), не исключение;
+* `.env` **не** источник продакшн-конфигурации. На сервере он пустой.
+
+Проверка перед коммитом:
+
+```
+git grep -nI "sk-\|Bz9ZrOY\|1f9e5104" -- . ':!*.example'
+```
+
 ---
 
 ## Что это
@@ -17,6 +47,13 @@ Telethon (MTProto), и тогда dot-команды работают **в лю�
 |---|---|---|
 | `bot.py`, `handlers/commands/`, `handlers/session.py`, `handlers/inline/` | aiogram (Bot API) | **только личка с ботом**: `/start`, auth-кнопки, inline |
 | `utils/telethon_manager.py` | Telethon (MTProto) | **все остальные чаты** — sole executor |
+
+LLM-бэкенд (`.ии`, `.tr ai`) — ddt-прокси, OpenAI-совместимый
+`/v1/chat/completions`. Два отличия от обычного OpenAI: заголовок
+`X-DDT-Group` — **приоритет** группы, а не фильтр (нет ключа под модель →
+запрос уйдёт в другую группу), и `model` в теле ответа. Поэтому в футере
+ответа `.ии` подписывается фактическая модель, а не заданная в конфиге
+(`AI_SHOW_MODEL`). Клиент: `utils/ai.py`, модели и фолбэк — `config.AI_MODEL*`.
 
 Telegram Business API **не используется**. Из проекта удалены:
 `handlers/business.py`, `handlers/messages.py`, `handlers/deletions.py`.
