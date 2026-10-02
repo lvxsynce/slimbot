@@ -25,6 +25,7 @@ import re
 from typing import Any
 
 from aiogram import F, Router, types
+from aiogram.dispatcher.event.bases import SkipHandler
 
 from utils import modules as M
 from utils import rate_limit_gate as gate
@@ -440,16 +441,33 @@ async def conflict_cb(callback: types.CallbackQuery):
     await callback.answer()
 
 
-@router.message(F.text)
+def _awaiting_rename(message: types.Message) -> bool:
+    """Фильтр: юзер сейчас ждёт нового имени команды.
+
+    **Почему это фильтр, а не проверка внутри хендлера.** Раньше стояло
+    `@router.message(F.text)` с ранним `return`. В aiogram хендлер, который
+    отработал и вернул не-`UNHANDLED`, **останавливаетPropagation**: все
+    роутеры после него (включая `_fallback_router` и роутеры модулей)
+    не обходятся. Такой хендлер глотал любое текстовое сообщение — и
+    подсказки опечаток (`.пингг` → «возможно, это `.ping`?») исчезли
+    совсем. Состояние «ждём имя» узкое, поэтому и фильтр должен быть
+    узким.
+    """
+    uid = str(message.from_user.id) if message.from_user else ""
+    return bool(uid) and uid in _pending_rename
+
+
+@router.message(F.text, _awaiting_rename)
 async def pending_rename_listener(message: types.Message):
     """Ожидание нового имени команды (после «Своё имя»)."""
     uid = str(message.from_user.id) if message.from_user else ""
     state = _pending_rename.get(uid)
     if not state:
-        return
+        # Фильтр и тело рассинхронились — лучше не мешать, чем глотать.
+        raise SkipHandler()
     if (message.text or "").strip().startswith("/modules"):
         _pending_rename.pop(uid, None)
-        return
+        raise SkipHandler()
 
     _pending_rename.pop(uid, None)
     result = M.resolve_conflict(state["conflict"], "rename", message.text or "")
@@ -552,21 +570,27 @@ async def dispatch_module_command(message: types.Message):
       * head заявлен, но юзер НЕ выбрал «заменить» для системной команды →
         модуль молчит, иначе он перехватил бы `.ping` молча;
       * head заявлен и системная команда отключена юзером → выполняем.
+
+    **Все ранние выходы поднимают `SkipHandler`, а не просто `return`.**
+    Хендлер, вернувший не-`UNHANDLED`, останавливает обход в aiogram, и
+    все роутеры после него (включая `_fallback_router`) пропускаются.
+    Обычный `return` здесь означал «этот хендлер отработал» — то есть
+    `.пингг` и любая опечатка глохли молча вместо подсказки.
     """
     uid = str(message.from_user.id) if message.from_user else ""
     if not M.modules_enabled() or not uid or not M.module_allowed(uid):
-        return
+        raise SkipHandler()
     text = (message.text or "").strip()
     head = text.split(maxsplit=1)[0].lower()
     spec = M.find_command(uid, head)
     if spec is None:
-        return
+        raise SkipHandler()
     if "bot" not in getattr(spec.handler, "_module_paths", ("telethon", "bot")):
-        return
+        raise SkipHandler()
     # Модуль заявил системную команду, но юзер не подтвердил замену —
     # отдаём обработку дальше (fallback предложит подсказку).
     if head in M.system_heads() and not M.is_system_disabled(uid, head):
-        return
+        raise SkipHandler()
 
     match = _TEXT_RE.match(text)
     args = (match.group("args") or "").strip() if match else ""
@@ -582,6 +606,8 @@ async def dispatch_module_command(message: types.Message):
         return
     text_out = result if isinstance(result, str) else str(result)
     if not text_out.strip():
+        # Хендлер отработал (команда существует), но решил промолчать —
+        # возвращаем `None` осознанно, цепочка на этом заканчивается.
         return
     try:
         await message.reply(text_out, **thread_kwargs(message))

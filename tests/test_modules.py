@@ -15,10 +15,12 @@
 """
 
 import asyncio
+import datetime as _dt
 import textwrap
 from types import SimpleNamespace
 
 import pytest
+from aiogram import Bot
 
 from utils import cmds, modules as M
 from utils.modules import Conflict, Context, ModuleError
@@ -120,10 +122,18 @@ def isolated_storage(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def clean_registry():
     """Каждый тест стартует с пустым реестром и с системными head'ами."""
+    import handlers.commands as C
+
     M.reset_all()
     M.set_system_heads(cmds.CMDS)
     yield
     M.reset_all()
+    # `handlers.commands.router` может остаться привязанным к Dispatcher от
+    # теста, который прогонял апдейты: `include_router` ставит `parent_router`
+    # и сам Dispatcher, и следующий `include` того же роутера падает
+    # «already attached». Отцепляем после каждого теста.
+    C.router._parent_router = None
+    C._module_routers = None
 
 
 def _install(uid: int, name: str, source: str):
@@ -1070,6 +1080,279 @@ def test_startup_helper_survives_broken_module():
 
 
 # --------------------------------------------------------------------------
+# aiogram-роутер модуля: подключение + изоляция по владельцу
+# --------------------------------------------------------------------------
+
+WITH_ROUTER = textwrap.dedent('''
+    from aiogram import F, Router
+    from slimbot_api import command
+
+    MODULE = {"name": "Routed", "version": "1"}
+
+    @command(".routed")
+    async def routed(ctx):
+        return f"dot:{ctx.user_id}"
+
+    router = Router()
+
+    @router.message(F.text == "/routed-menu")
+    async def menu(message):
+        await message.answer(f"menu:{message.from_user.id}")
+''')
+
+
+def _clone_chain():
+    """Роутер боевой цепочки — как есть.
+
+    Клонировать нельзя: `Dispatcher` обходит событие по ссылкам
+    `parent_router`, а `include_router` падает на уже подключённом
+    роутере («already attached»). Поэтому тесты просто включают
+    настоящий `handlers.commands.router` в свой `Dispatcher` — в
+    тестовой сессии он ни к чему не подключён.
+    """
+    import handlers.commands as C
+
+    return C.router
+
+
+def _feed(uid: int, text: str) -> list[str]:
+    """Прогнать сообщение через НАСТОЯЩИЙ Dispatcher и цепочку бота.
+
+    `Update` — pydantic-модель, поэтому стаб обязан быть её экземпляром.
+    Собираем через `model_construct`: он не валидирует, но создаёт
+    настоящий объект `Message`, который aiogram готов принять. Ручной
+    `SimpleNamespace` здесь не подходит — pydantic его отвергает, и
+    тест проверял бы не то.
+    """
+    from aiogram import Dispatcher
+    from aiogram.types import Chat, Message, Update, User
+
+    from aiogram.types import Chat, Message, Update, User
+
+    sent: list[str] = []
+    msg = Message(
+        message_id=1,
+        date=_dt.datetime.now(_dt.timezone.utc),
+        chat=Chat(id=1, type="private"),
+        from_user=User(id=uid, is_bot=False, first_name="u"),
+        text=text,
+    )
+    dp = Dispatcher()
+    # `include_router` оставляет роутер привязанным к Dispatcher, а сам
+    # `handlers.commands.router` переиспользуется следующими тестами.
+    # Отцепляем в `finally` ДО и после вызова: иначе второй прогон упадёт
+    # «already attached», а упасть он может прямо на `include_router`.
+    try:
+        dp.include_router(_clone_chain())
+        # Настоящий `Bot` (конструктор не ходит в сеть) — стабы с
+        # `session.api.is_local` ломают outer-middleware aiogram.
+        asyncio.run(dp.feed_update(_spy_bot(sent), Update(update_id=1, message=msg)))
+    finally:
+        _detach_test()
+    return sent
+
+
+def _detach_test() -> None:
+    """Отцепить боевой роутер от тестового Dispatcher.
+
+    `Dispatcher` — это тоже `Router`, поэтому `include_router` прописывает
+    его как `parent_router` и в `sub_routers`. Пока связь жива, следующий
+    тест сможет включить роутер только в новый Dispatcher.
+    """
+    import handlers.commands as C
+
+    C.router._parent_router = None
+
+
+def _spy_bot(sent: list[str]) -> Bot:
+    """Настоящий `Bot`, у которого ответы пишутся в `sent` вместо сети."""
+    bot = Bot(token="123456:TEST_TOKEN_FOR_LOCAL_DISPATCH_ONLY")
+
+    async def send_message(self, chat_id, text, **kwargs):
+        sent.append(text)
+        return None
+
+    async def call(self, method, request_timeout=None):
+        if getattr(method, "text", None):
+            sent.append(method.text)
+        return None
+
+    bot.send_message = send_message.__get__(bot, type(bot))
+    bot.__class__ = type("SpyBot", (Bot,), {
+        "send_message": send_message,
+        "__call__": call,
+    })
+    return bot
+
+
+def test_module_router_is_attached():
+    import handlers.commands as C
+
+    info = _install(UID_A, "routed", WITH_ROUTER)
+    assert info.router is not None
+    assert info.router in C.router.sub_routers, "роутер модуля не подключён"
+
+
+def test_module_router_sits_before_fallback():
+    import handlers.commands as C
+
+    info = _install(UID_A, "routed", WITH_ROUTER)
+    sub = C.router.sub_routers
+    assert sub[-1] is C._fallback_router, "fallback должен остаться последним"
+    assert sub.index(info.router) < sub.index(C._fallback_router)
+
+
+def test_module_router_after_modules_router():
+    """Роутер модуля должен идти ПОСЛЕ `handlers/commands/modules.py`.
+
+    Иначе `/modules`-хендлеры (установка, конфликты) окажутся за
+    роутером модуля, и юзер не сможет управлять модулями.
+    """
+    import handlers.commands as C
+
+    info = _install(UID_A, "routed", WITH_ROUTER)
+    sub = C.router.sub_routers
+    own = [i for i, r in enumerate(sub) if r.name == "modules"]
+    assert own and sub.index(info.router) > own[0]
+
+
+def test_module_router_is_walked_by_dispatcher():
+    """ГЛАВНАЯ проверка подключения.
+
+    `Dispatcher` обходит событие по `parent_router`, а не по наличию в
+    `sub_routers`. Роутер, добавленный в список без родителя, выглядит
+    подключённым (`in sub_routers` → True), но его хендлеры не срабатывают
+    никогда. Поэтому проверяем именно `chain_tail` — то, что реально
+    обходит диспетчер.
+    """
+    import handlers.commands as C
+
+    info = _install(UID_A, "routed", WITH_ROUTER)
+    tail = list(C.router.chain_tail)
+    assert info.router in tail, "роутер модуля не в chain_tail — хендлеры не сработают"
+    assert info.router.parent_router is C.router, "нет связи parent_router"
+
+
+def test_module_router_handlers_do_not_break_invariants():
+    """Инвариант 1: на `handlers.commands.router` ноль хендлеров."""
+    import handlers.commands as C
+
+    _install(UID_A, "routed", WITH_ROUTER)
+    assert not C.router.message.handlers
+
+
+def test_module_router_works_for_owner():
+    _install(UID_A, "routed", WITH_ROUTER)
+    assert _feed(UID_A, "/routed-menu") == [f"menu:{UID_A}"]
+
+
+def test_module_router_is_silent_for_other_user():
+    """ГЛАВНАЯ проверка: хендлер роутера модуля не срабатывает у чужого."""
+    _install(UID_A, "routed", WITH_ROUTER)
+    assert _feed(UID_B, "/routed-menu") == [], "хендлер модуля сработал у чужого юзера"
+
+
+def test_module_router_unload_detaches():
+    """Выгрузка обязана снять роутер, иначе хендлеры остались бы висеть."""
+    import handlers.commands as C
+
+    info = _install(UID_A, "routed", WITH_ROUTER)
+    M.unload_module(UID_A, "routed")
+    assert info.router not in C.router.sub_routers
+    assert C.router.sub_routers[-1] is C._fallback_router
+
+
+def test_module_router_no_duplicates_on_reload():
+    import handlers.commands as C
+
+    _install(UID_A, "routed", WITH_ROUTER)
+    M.load_module(UID_A, "routed")
+    M.load_module(UID_A, "routed")
+    routers = [r for r in C.router.sub_routers if r.message.handlers]
+    assert len(routers) == len(set(id(r) for r in routers)), "роутер продублирован"
+    assert len(C.router.sub_routers) == len(set(id(r) for r in C.router.sub_routers))
+
+
+def test_non_router_object_is_rejected():
+    """`router = "что-то"` без декораторов — внятная ошибка вместо тишины."""
+    src = textwrap.dedent('''
+        from slimbot_api import command
+
+        MODULE = {"name": "BadRouter", "version": "1"}
+
+        router = "not a router"
+
+        @command(".br")
+        async def br(ctx):
+            return "x"
+    ''')
+    M.save_module_source(UID_A, "badrouter", src)
+    with pytest.raises(ModuleError, match="aiogram.Router"):
+        M.load_module(UID_A, "badrouter")
+
+
+def test_decorating_non_router_fails_on_import():
+    """`@router.message` поверх строки падает на импорте — и это понятно.
+
+    Отдельный случай от предыдущего: декоратор вызывается самим модулем
+    ещё до нашей проверки, поэтому сообщение приходит из кода автора.
+    """
+    src = WITH_ROUTER.replace("router = Router()", 'router = "not a router"')
+    M.save_module_source(UID_A, "badrouter2", src)
+    with pytest.raises(ModuleError, match="has no attribute 'message'"):
+        M.load_module(UID_A, "badrouter2")
+
+
+def test_module_with_only_router_is_accepted():
+    src = textwrap.dedent('''
+        from aiogram import F, Router
+
+        MODULE = {"name": "OnlyRouter", "version": "1"}
+
+        router = Router()
+
+        @router.message(F.text == "/only")
+        async def only(message):
+            await message.answer("ok")
+    ''')
+    info = _install(UID_A, "onlyr", src)
+    assert info.router is not None
+    assert info.commands == []
+
+
+def test_modules_router_does_not_swallow_others():
+    """ГЛАВНАЯ регрессия v1.5.0.
+
+    Хендлер на `handlers.commands.modules.router` с фильтром «любой текст»
+    отработал бы и вернул не-`UNHANDLED` — а в aiogram это останавливает
+    обход ВСЕЙ цепочки: до `_fallback_router` (и до роутеров модулей)
+    управление просто не доходит. Юзер терял подсказки опечаток.
+
+    Проверяем на настоящем Dispatcher: `.пингг` обязана получить
+    подсказку «возможно, это .ping?».
+    """
+    sent = _feed(UID_A, ".пингг")
+    assert sent, "подсказка опечатки пропала — её глотает чужой хендлер"
+    assert ".ping" in sent[0]
+
+
+def test_modules_router_does_not_swallow_start():
+    """`/start` должен доходить до `start.py`."""
+    sent = _feed(UID_A, "/start")
+    assert sent and "Slim bot" in sent[0]
+
+
+def test_module_router_is_reachable_after_modules_router():
+    """Роутер модуля стоит ПОСЛЕ `modules`, иначе `/modules` не работал бы."""
+    import handlers.commands as C
+
+    _install(UID_A, "routed", WITH_ROUTER)
+    sub = C.router.sub_routers
+    own = next(i for i, r in enumerate(sub) if r.name == "modules")
+    assert sub.index(sub[-1]) > own
+
+
+# --------------------------------------------------------------------------
 # aiogram-слой: роутер и хендлеры
 # --------------------------------------------------------------------------
 
@@ -1101,82 +1384,82 @@ def test_source_has_no_conflict_handler_on_wrong_router():
     assert 'callback_query(F.data.startswith("mcf:"))' in src
 
 
-def test_bot_path_dispatches_module_command():
+def _dispatch_bot(text: str, uid: int) -> list[str]:
+    """Прогнать dot-команду через `dispatch_module_command` и собрать ответы.
+
+    `SkipHandler` — ожидаемый исход, когда команда не наша: он означает
+    «пропусти дальше», а не «ответил».
+    """
+    from aiogram.dispatcher.event.bases import SkipHandler
+
     from handlers.commands import modules as modules_mod
 
-    _install(UID_A, "notes", SIMPLE)
     sent: list[str] = []
 
     class Msg:
-        text = ".note привет"
-        from_user = SimpleNamespace(id=UID_A)
-        bot = SimpleNamespace(name="bot")
+        def __init__(self):
+            self.text = text
+            self.from_user = SimpleNamespace(id=uid)
+            self.bot = SimpleNamespace(name="bot")
+            self.chat = SimpleNamespace(id=1, type="private")
+            self.message_thread_id = None
 
         async def reply(self, text, **kwargs):
             sent.append(text)
 
-    asyncio.run(modules_mod.dispatch_module_command(Msg()))
+        async def answer(self, text, **kwargs):
+            sent.append(text)
+
+    try:
+        asyncio.run(modules_mod.dispatch_module_command(Msg()))
+    except SkipHandler:
+        pass
+    return sent
+
+
+def test_bot_path_dispatches_module_command():
+    _install(UID_A, "notes", SIMPLE)
+    sent = _dispatch_bot(".note привет", UID_A)
     assert sent and "привет" in sent[0]
+
+
+def test_bot_path_skips_unknown_command():
+    """Не наша команда → `SkipHandler`, чтобы дошёл fallback с подсказкой."""
+    from aiogram.dispatcher.event.bases import SkipHandler
+
+    from handlers.commands import modules as modules_mod
+
+    _install(UID_A, "notes", SIMPLE)
+
+    class Msg:
+        text = ".пингг"
+        from_user = SimpleNamespace(id=UID_A)
+        bot = SimpleNamespace(name="bot")
+        chat = SimpleNamespace(id=1, type="private")
+        message_thread_id = None
+
+    with pytest.raises(SkipHandler):
+        asyncio.run(modules_mod.dispatch_module_command(Msg()))
 
 
 def test_bot_path_ignores_other_users_module():
     """Та же изоляция в личке с ботом: модуль A не должен ловить `.note` у B."""
-    from handlers.commands import modules as modules_mod
-
     _install(UID_A, "notes", SIMPLE)
-    sent: list[str] = []
-
-    class Msg:
-        text = ".note привет"
-        from_user = SimpleNamespace(id=UID_B)
-        bot = SimpleNamespace(name="bot")
-
-        async def reply(self, text, **kwargs):
-            sent.append(text)
-
-    asyncio.run(modules_mod.dispatch_module_command(Msg()))
-    assert sent == [], "модуль юзера A выполнился в личке юзера B"
+    assert _dispatch_bot(".note привет", UID_B) == [], "модуль A выполнился у B"
 
 
 def test_bot_path_disabled_system_is_not_claimed():
-    """Выключенная юзером системная команда не уходит в модуль молча."""
-    from handlers.commands import modules as modules_mod
-
+    """Юзер решил оставить системный `.ping` — модуль его не забирает."""
     _install(UID_A, "hijack", HIJACK)
-    sent: list[str] = []
 
-    class Msg:
-        text = ".ping"
-        from_user = SimpleNamespace(id=UID_A)
-        bot = SimpleNamespace(name="bot")
-
-        async def reply(self, text, **kwargs):
-            sent.append(text)
-
-    # Юзер решил оставить системный .ping: fallback должен предложить
-    # подсказку, но не отправлять «hijacked».
     M.enable_system(str(UID_A), ".ping")
-    asyncio.run(modules_mod.dispatch_module_command(Msg()))
-    assert "hijacked" not in sent
+    assert "hijacked" not in _dispatch_bot(".ping", UID_A)
 
-    # А после явного «заменить» — уже выполняется.
     M.disable_system(str(UID_A), ".ping")
-    sent.clear()
-    asyncio.run(modules_mod.dispatch_module_command(Msg()))
-    assert sent == ["hijacked"]
+    assert _dispatch_bot(".ping", UID_A) == ["hijacked"]
 
 
 def test_bot_path_ignores_non_module_command():
-    from handlers.commands import modules as modules_mod
-
-    called: list[str] = []
-
-    class Msg:
-        text = ".ping"
-        from_user = SimpleNamespace(id=UID_A)
-
-        async def reply(self, text, **kwargs):
-            called.append(text)
-
-    asyncio.run(modules_mod.dispatch_module_command(Msg()))
-    assert called == [], ".ping без решения по конфликту не должен уйти в модуль"
+    _install(UID_A, "hijack", HIJACK)
+    M.enable_system(str(UID_A), ".ping")
+    assert _dispatch_bot(".ping", UID_A) == [], ".ping без решения не должен уйти в модуль"

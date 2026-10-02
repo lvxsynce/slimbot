@@ -463,9 +463,13 @@ def load_module(uid: str, name: str) -> ModuleInfo:
         _purge_modules(module_id)
         raise ModuleError(f"{type(e).__name__}: {e}") from e
 
-    info.router = getattr(mod, "router", None)
     info.loaded_at = time.time()
     _collect(mod, info)
+    try:
+        info.router = _module_router(mod, info)
+    except ModuleError:
+        _purge_modules(module_id)
+        raise
 
     if not info.commands and not info.inline and info.router is None:
         _purge_modules(module_id)
@@ -475,9 +479,187 @@ def load_module(uid: str, name: str) -> ModuleInfo:
 
     _registry.setdefault(uid, {})[name] = info
     _reindex()
-    logger.info("modules: loaded %s for uid=%s (dot=%d inline=%d)",
-                name, uid, len(info.commands), len(info.inline))
+    _safe_sync_routers()
+    logger.info("modules: loaded %s for uid=%s (dot=%d inline=%d router=%s)",
+                name, uid, len(info.commands), len(info.inline), bool(info.router))
     return info
+
+
+def _module_router(mod: Any, info: "ModuleInfo") -> Any:
+    """Роутер модуля с фильтром по владельцу — либо None.
+
+    Модуль может отдать свой `aiogram.Router` с обычными хендлерами.
+    Роутер подключается к общей цепочке **один раз на бота**, поэтому
+    изоляцию нельзя обеспечить «подключением только для своего юзера»:
+    цепочка общая для всех. Вместо этого каждый observer роутера
+    получает фильтр `_owned_by(uid)`, пропускающий событие только от
+    владельца модуля.
+
+    Обёртка ставится на observer'ы (`message`, `callback_query`,
+    `edited_message`…), потому что хендлеров модуля может быть сколько
+    угодно и все они должны быть отфильтрованы одинаково.
+    """
+    from aiogram import Router
+
+    router = getattr(mod, "router", None)
+    if router is None:
+        return None
+    if not isinstance(router, Router):
+        # `router = "что-то"` — частая ошибка. Молча игнорировать нельзя:
+        # автор потом гадает, почему хендлеры не срабатывают.
+        raise ModuleError(
+            f"router в модуле должен быть aiogram.Router, а не "
+            f"{type(router).__name__}"
+        )
+    if not getattr(router.message, "handlers", None):
+        # Роутер есть, но пустой (`Router()` без хендлеров) — команда
+        # от `@command` работает, роутер в цепочку не нужен.
+        return None
+
+    owner = info.user_id
+    for observer in _observers(router):
+        observer.filter(_owned_by(owner))
+    return router
+
+
+def _observers(router: Any) -> list:
+    """Все observers роутера, у которых есть хендлеры."""
+    out = []
+    for name in dir(router):
+        if name.startswith("_"):
+            continue
+        attr = getattr(router, name, None)
+        if hasattr(attr, "handlers") and hasattr(attr, "filter"):
+            if getattr(attr, "handlers", None):
+                out.append(attr)
+    return out
+
+
+def _owned_by(uid: str):
+    """aiogram-фильтр: событие только от владельца модуля.
+
+    Именно **функция**, а не класс с `async def __call__`. aiogram
+    определяет «-await ли этот фильтр» через
+    `inspect.iscoroutinefunction(callback)`, а для экземпляра класса с
+    асинхронным `__call__` она возвращает False: aiogram вызывает
+    фильтр как обычный, получая нераскрытый coroutine (и ругается
+    `coroutine ... was never awaited`). Фильтр при этом не срабатывал
+    вовсе — хендлеры модуля молча не работали.
+    """
+    owner = str(uid)
+
+    async def _check(event: Any) -> bool:
+        user = getattr(event, "from_user", None)
+        if user is None:
+            # Апдейт без отправителя (channel_post и т.п.) — не наш.
+            return False
+        try:
+            return str(user.id) == owner
+        except Exception:
+            return False
+
+    _check.__name__ = f"owned_by_{owner}"
+    return _check
+
+
+def module_routers() -> list:
+    """Все роутеры загруженных модулей — для подключения в цепочку."""
+    out = []
+    for mods in _registry.values():
+        for info in mods.values():
+            if info.router is not None:
+                out.append(info.router)
+    return out
+
+
+def sync_routers() -> int:
+    """Подключить роутеры модулей в цепочку aiogram. Возвращает их число.
+
+    Вызывается из `bot.py::on_startup` и после каждой установки/
+    удаления модуля.
+
+    **Почему нельзя просто `sub_routers.insert(...)`.**
+    Диспетчер обходит событие по `Router.chain_head`, а тот идёт по
+    ссылкам `parent_router` — прямая вставка в список эту связь не
+    создаёт. Роутер оказывался в `sub_routers` (тесты на это смотрели
+    и проходили), но **никогда не обходился**: хендлеры модуля молча
+    не срабатывали. Поэтому подключаем через `include_router` (он
+    честно ставит родителя), а позицию потом двигаем вручную —
+    на порядок обхода влияет именно список, а не родитель.
+
+    Позиция — перед `_fallback_router`: иначе fallback отвечал бы
+    подсказкой вместо хендлера модуля (та же причина, что и для
+    `handlers/commands/modules.py`).
+    """
+    import handlers.commands as C
+
+    for router in (getattr(C, "_module_routers", None) or []):
+        _detach(C.router, router)
+
+    fresh = module_routers()
+    for router in fresh:
+        if router.parent_router is not None:
+            # Уже подключён (например, после reload того же модуля) —
+            # снять, иначе include_router бросит «already attached».
+            _detach(router.parent_router, router)
+        C.router.include_router(router)
+        _move_before_fallback(C.router, router)
+    C._module_routers = fresh
+    return len(fresh)
+
+
+def fallback_router() -> Any:
+    """`_fallback_router` из `handlers.commands` либо None.
+
+    Отдельная функция, потому что это атрибут МОДУЛЯ, а не роутера:
+    обращение `router._fallback_router` тихо падало в `AttributeError`,
+    и `sync_routers` уходил в ветку «append в конец» — роутер модуля
+    оказывался ПОСЛЕ fallback и не обходился вовсе.
+    """
+    try:
+        import handlers.commands as C
+
+        return C._fallback_router
+    except Exception:
+        return None
+
+
+def _move_before_fallback(parent: Any, router: Any) -> None:
+    """Поставить `router` перед `_fallback_router`, но ПОСЛЕ `modules`.
+
+    Позиция не произвольная:
+      * после `handlers/commands/modules.py` — иначе роутер модуля
+        перехватил бы `/modules`, и управлять модулями стало бы
+        невозможно (а у него нет фильтра на `/modules`);
+      * перед `_fallback_router` — иначе fallback отвечал бы подсказкой
+        вместо хендлера модуля.
+    """
+    subs = parent.sub_routers
+    subs.remove(router)
+    anchor = fallback_router()
+    if anchor is None or anchor not in subs:
+        subs.append(router)
+        return
+    at = subs.index(anchor)
+    # `modules` может быть уже подключён — тогда вставляем за ним,
+    # но строго до anchor.
+    for i, other in enumerate(subs[:at]):
+        if getattr(other, "name", "") == "modules":
+            at = min(at, i + 1)
+    subs.insert(at, router)
+
+
+def _detach(parent: Any, router: Any) -> None:
+    """Отключить роутер от родителя.
+
+    `parent_router` в aiogram умеет только установку и бросает
+    «already attached» при повторе, поэтому сброс идёт через
+    приватное поле — единственный способ отцепить роутер и
+    подключить его позже заново.
+    """
+    if router in parent.sub_routers:
+        parent.sub_routers.remove(router)
+    router._parent_router = None
 
 
 def _collect(mod: Any, info: ModuleInfo) -> None:
@@ -511,6 +693,22 @@ def _unload_locked(uid: str, name: str) -> None:
     if uid in _registry and not _registry[uid]:
         _registry.pop(uid, None)
     _reindex()
+    _safe_sync_routers()
+
+
+def _safe_sync_routers() -> None:
+    """`sync_routers` не должен ронять установку модуля.
+
+    Здесь тянется `handlers.commands` (который тянет aiogram и весь
+    `handlers/commands/*`) — если импорт падает (цикл, частично
+    установленное окружение), модуль всё равно должен загрузиться:
+    команды работают, не работает только aiogram-роутер.
+    """
+    try:
+        sync_routers()
+    except Exception:
+        logger.exception("modules: router sync failed — команды модуля работают, "
+                         "aiogram-роутеры пока нет")
 
 
 def reload_all() -> dict[str, str]:
@@ -843,6 +1041,10 @@ def reset_all() -> None:
     _renames.clear()
     _pending.clear()
     _system_heads = frozenset()
+    try:
+        sync_routers()
+    except Exception:
+        pass
 
 
 def _system_gate_snapshot() -> set[str]:
@@ -1049,6 +1251,8 @@ __all__ = [
     "resolve_conflict",
     "run_command",
     "save_module_source",
+    "module_routers",
+    "sync_routers",
     "set_system_heads",
     "system_command_title",
     "system_heads",
