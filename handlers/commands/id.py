@@ -1,6 +1,6 @@
 from aiogram import Router, types
 
-from ._base import render_id, format_id, thread_kwargs
+from ._base import render_id, thread_kwargs
 
 router = Router()
 

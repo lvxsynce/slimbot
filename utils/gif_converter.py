@@ -125,6 +125,11 @@ def probe_duration(path: str) -> float | None:
     Нужна, чтобы fps подбирался под реальную длину клипа: у кружков она
     варьируется от 1 до 60 секунд, и фиксированные 4 секунды показывали
     только начало длинных.
+
+    ВНИМАНИЕ: это БЛОКИРУЮЩИЙ ``subprocess.run``. Вызывать только через
+    :func:`probe_duration_async`, который уводит его в поток — иначе event
+    loop встаёт на всё время ffprobe (до 20 с) и в это время не может
+    обслуживать ни один Telethon-клиент.
     """
     import subprocess
     try:
@@ -137,6 +142,12 @@ def probe_duration(path: str) -> float | None:
     except Exception as e:
         logger.debug(f"probe_duration failed: {e}")
         return None
+
+
+async def probe_duration_async(path: str) -> float | None:
+    """Неблокирующая обёртка над :func:`probe_duration`."""
+    import asyncio
+    return await asyncio.to_thread(probe_duration, path)
 
 
 def _video_ext(data: bytes) -> str:
@@ -407,7 +418,7 @@ async def video_to_gif_bytes(
         window = float(max_duration_s)
         fps = float(max_fps)
         if fit_frames:
-            probed = probe_duration(tmp_path)
+            probed = await probe_duration_async(tmp_path)
             if probed and probed > 0:
                 window = min(probed, GIF_SOURCE_MAX_DURATION_S)
                 want = fit_frames / max(window, 0.1)
@@ -441,14 +452,19 @@ async def video_to_gif_bytes(
                 proc.communicate(),
                 timeout=timeout_s,
             )
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            # CancelledError сюда приходит от внешнего
+            # `wait_for(..., 300)` в telethon_manager.outgoing_handler.
+            # Раньше ловился только TimeoutError, поэтому при отмене задачи
+            # `proc.kill()` НЕ вызывался и ffmpeg оставался осиротевшим
+            # процессом, жующим CPU и память.
             proc.kill()
             try:
                 await proc.wait()
             except Exception:
                 pass
             logger.warning(
-                f"video_to_gif_bytes: ffmpeg timeout after {timeout_s}s "
+                f"video_to_gif_bytes: ffmpeg timeout/cancel after {timeout_s}s "
                 f"(input={len(data)} bytes, max_width={max_width})"
             )
             return None
@@ -558,13 +574,15 @@ async def webm_to_rgba_frames(
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=data), timeout=timeout_s,
         )
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, asyncio.CancelledError):
+        # CancelledError — от внешнего wait_for в outgoing_handler. Без него
+        # в kill() ffmpeg-процесс утекал бы сиротой.
         proc.kill()
         try:
             await proc.wait()
         except Exception:
             pass
-        logger.debug("webm_to_rgba_frames: ffmpeg timeout")
+        logger.debug("webm_to_rgba_frames: ffmpeg timeout/cancel")
         return []
     if proc.returncode != 0 or not stdout:
         logger.debug(
@@ -800,13 +818,15 @@ async def image_audio_to_video_bytes(
                 proc2.communicate(input=audio_bytes),
                 timeout=timeout_s,
             )
-        except _asyncio.TimeoutError:
+        except (_asyncio.TimeoutError, _asyncio.CancelledError):
+            # См. комментарий в video_to_gif_bytes: отмена задачи тоже
+            # обязана убивать процесс, иначе он живёт сиротой.
             proc2.kill()
             try:
                 await proc2.wait()
             except Exception:
                 pass
-            logger.warning("image_audio_to_video_bytes: ffmpeg timeout")
+            logger.warning("image_audio_to_video_bytes: ffmpeg timeout/cancel")
             return None
         if proc2.returncode != 0:
             msg = stderr.decode("utf-8", errors="replace").strip()[-200:]

@@ -4,13 +4,9 @@ from html import escape as _h
 from aiogram import Router, types
 
 from utils.storage import get_user_tz, set_user_tz
-from utils.timezones import (
-    RU_ALIASES,
-    TZ_PRESETS,
-    _canonicalize,
-    is_reset_value,
-)
+from utils.timezones import is_reset_value
 from utils.texts import Texts, render_for_user
+from utils.shared_cmd import timezone_body, timezone_parse
 from ._base import command_card, thread_kwargs
 
 router = Router()
@@ -30,37 +26,14 @@ def _args(text: str) -> str:
     return parts[1] if len(parts) > 1 else ""
 
 
-def _list_presets() -> str:
-    """Возвращает текст списка пресетов для `.timezone без аргумента`."""
-    lines = []
-    for name, offset, remark in TZ_PRESETS:
-        lines.append(f"• <b>{_h(name)}</b> (<code>{offset}</code>) — {_h(remark)}")
-    return "\n".join(lines)
-
-
 async def _status_text(uid: str) -> str:
-    cur = get_user_tz(uid)
+    """Карточка `.timezone` без аргументов.
+
+    Тело — из `utils/shared_cmd.timezone_body` (общее с Telethon-путём);
+    сюда передаётся только premium-заголовок из `Texts.Timezone.TITLE`.
+    """
     title = await render_for_user(uid, Texts.Timezone.TITLE)
-    if cur:
-        current_line = await render_for_user(uid, Texts.Timezone.CURRENT, cur=cur)
-    else:
-        current_line = Texts.Timezone.CURRENT_DEFAULT.render(premium=False)
-    examples = Texts.Timezone.EXAMPLES.render(premium=False)
-    examples_block = "\n".join(Texts.Timezone.EXAMPLE_LINES)
-    presets_title = Texts.Timezone.PRESETS_TITLE.render(premium=False)
-    apply_hint = Texts.Timezone.APPLY_HINT.render(premium=False)
-    lines = [
-        title,
-        current_line,
-        "",
-        examples,
-        examples_block,
-        "",
-        presets_title,
-        _list_presets(),
-        apply_hint,
-    ]
-    return command_card("Timezone", "\n".join(lines))
+    return command_card("Timezone", timezone_body(get_user_tz(uid), title=title))
 
 
 async def _do_timezone(uid: str, args: str) -> str:

@@ -67,13 +67,14 @@ def test_telethon_session_gate_allows_only_active_owners(monkeypatch):
     assert storage.session_exists("other") is False
 
 
-def test_text_templates_have_external_title_and_no_emoji():
-    from utils.texts import Texts
+def test_command_card_has_external_title_and_single_quote():
+    """Заголовок задаёт command_card, blockquote ровно один."""
+    from handlers.commands._base import command_card
 
-    rendered = Texts.Ping.PING.render(ms="12")
+    rendered = command_card("Ping", "Telegram API RTT: 12 ms")
     assert rendered.startswith("<b>Slim bot | Ping</b>")
     assert rendered.count("<blockquote>") == 1
-    assert "🏓" not in rendered
+    assert rendered.count("</blockquote>") == 1
 
 
 def test_runtime_paths_are_not_cwd_relative():

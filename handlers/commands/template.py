@@ -23,15 +23,15 @@ import logging
 import time
 
 from utils import media_kind as mk
+from utils.cmds import SHAB_ADD_CMDS as ADD_CMDS
+from utils.cmds import SHAB_BASE_CMDS as BASE_CMDS
+from utils.cmds import SHAB_DEL_CMDS as DEL_CMDS
+from utils.cmds import TEMPLATE_CMDS as ALL_CMDS
+from utils.escape import esc as _esc
 
 from ._base import command_card
 
 logger = logging.getLogger(__name__)
-
-BASE_CMDS = (".шаб", ".шаблон", ".template", ".tmpl", ".tpl")
-ADD_CMDS = (".+шаб", ".+шаблон", ".+template", ".+tmpl", ".+tpl")
-DEL_CMDS = (".-шаб", ".-шаблон", ".-template", ".-tmpl", ".-tpl")
-ALL_CMDS = BASE_CMDS + ADD_CMDS + DEL_CMDS
 
 #: Зарезервированные имена: иначе `.шаб список` стал бы неоднозначным.
 RESERVED = frozenset({"список", "list", "все", "all"})
@@ -39,10 +39,6 @@ LIST_WORDS = frozenset({"список", "list", "ls"})
 
 #: Типы, для которых Telegram не умеет caption — при отправке подпись теряется.
 NO_CAPTION_KINDS = frozenset({mk.KIND_VOICE, mk.KIND_VIDEO_NOTE})
-
-
-def _esc(s) -> str:
-    return _html.escape(str(s if s is not None else ""), quote=False)
 
 
 def _fmt_size(n) -> str:

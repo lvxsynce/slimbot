@@ -20,22 +20,31 @@ from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import User as TUser
 
 from utils.bot_info import bot_username_at
+from utils.escape import esc as _esc
+from utils.inline_kb import connect_button
 from utils.storage import session_exists
 from utils.telethon_manager import telethon_manager
+from utils.tlm_common import render_usernames as _format_usernames_line
+from utils.tlm_common import usernames_of as _extract_telethon_usernames
 
-from . import connect_button
 from config import (
     DOT_TARGET_LIMIT as INLINE_USER_LIMIT,
     TELETHON_RESOLVE_TIMEOUT as TELETHON_TIMEOUT,
+    INLINE_CACHE_DEFAULT,
+    INLINE_CACHE_LOCKED,
+    INLINE_CACHE_PROFILE,
+    INLINE_CACHE_PROFILE_MULTI,
 )
 
 
-CACHE_TIME_SINGLE = 300
-CACHE_TIME_MULTI = 180
-
-
 def is_profile_query(q: str) -> bool:
-    return q.strip().startswith("@")
+    """Запрос начинается с `@` — это запрос профиля.
+
+    Раньше у этой функции не было ни одного вызова: `dispatch_inline`
+    проверял `q.startswith("@")` инлайн. Теперь используется как единая
+    проверка в диспетчере (см. handlers/inline/__init__.py).
+    """
+    return str(q or "").strip().startswith("@")
 
 
 _TARGET_SPLIT_RE = re.compile(r"[\s,]+")
@@ -72,18 +81,6 @@ def parse_inline_targets(query: str, limit: int = INLINE_USER_LIMIT) -> list[str
     return out
 
 
-def _esc(s) -> str:
-    """HTML-escape для user-controlled полей (first_name, last_name, ...)."""
-    if s is None:
-        return ""
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
 def _make_article(
     title: str,
     description: str,
@@ -99,33 +96,6 @@ def _make_article(
             parse_mode="HTML",
         ),
     )
-
-
-def _extract_telethon_usernames(entity, full_user) -> list[str]:
-    """Собирает активные usernames: collectibles (Premium) + legacy fallback.
-
-    Приоритет: сначала collectibles в порядке их объявления в профиле,
-    потом legacy `entity.username` если он не дублирует collectible.
-    """
-    out: list[str] = []
-    if full_user is not None:
-        for u in getattr(full_user, "usernames", None) or []:
-            active = getattr(u, "active", False)
-            uname = getattr(u, "username", None)
-            if active and uname and uname not in out:
-                out.append(uname)
-    legacy = getattr(entity, "username", None)
-    if legacy and legacy not in out:
-        out.append(legacy)
-    return out
-
-
-def _format_usernames_line(unames: list[str]) -> str:
-    if not unames:
-        return ""
-    if len(unames) == 1:
-        return f"Username: @{unames[0]}"
-    return "Usernames: " + " ".join(f"@{u}" for u in unames)
 
 
 def _format_profile(entity, full_user) -> str:
@@ -215,6 +185,13 @@ async def _resolve_one(client, target: str) -> tuple:
     except Exception as e:
         return (None, None, f"{type(e).__name__}: {e}")
 
+    if entity is None:
+        # Telethon на несуществующем entity бросает исключение, но обёртка
+        # или заглушка может вернуть None. Без этой проверки ниже падал бы
+        # `_format_profile(None, None)` → AttributeError прямо в хендлере,
+        # и юзер видел бы пустой список вместо карточки с ошибкой.
+        return (None, None, "сущность не найдена")
+
     full_user = None
     if isinstance(entity, TUser):
         try:
@@ -230,30 +207,30 @@ async def _resolve_one(client, target: str) -> tuple:
 
 def _hint_text() -> tuple[str, str, str]:
     """(title, description, text) для пустого запроса @bot @."""
-    bot = bot_username_at()
+    bot_at = bot_username_at()
     return (
         "Введи @username после бота",
-        f"{bot} @durov — карточка профиля",
+        f"{bot_at} @durov — карточка профиля",
         (
             "<b>🔍 Карточка профиля</b>\n\n"
-            f"Введи <code>{bot} @username</code> — например <code>{bot} @durov</code>.\n\n"
-            f"Можно несколько: <code>{bot} @a @b @c</code>.\n\n"
+            f"Введи <code>{bot_at} @username</code> — например <code>{bot_at} @durov</code>.\n\n"
+            f"Можно несколько: <code>{bot_at} @a @b @c</code>.\n\n"
             "<i>Резолв через твою Telethon-сессию.</i>"
         ),
     )
 
 
 def _need_session_text() -> tuple[str, str, str]:
-    bot = bot_username_at()
+    bot_at = bot_username_at()
     return (
         "Нужна Telethon-сессия",
         "Подключи Telethon, чтобы бот резолвил @юзернеймы.",
         (
             "<b>🔍 Нужен Telethon</b>\n\n"
-            f"Inline <code>{bot} @username</code> резолвит через твою Telethon-сессию. "
-            f"Подключи её в личке с <b>{bot}</b> через <b>/start</b>.\n\n"
-            f"Без сессии в инлайне доступны только <code>{bot} статус</code> "
-            f"и <code>{bot} помощь</code>."
+            f"Inline <code>{bot_at} @username</code> резолвит через твою Telethon-сессию. "
+            f"Подключи её в личке с <b>{bot_at}</b> через <b>/start</b>.\n\n"
+            f"Без сессии в инлайне доступны только <code>{bot_at} статус</code> "
+            f"и <code>{bot_at} помощь</code>."
         ),
     )
 
@@ -262,7 +239,7 @@ async def handle(inline: InlineQuery) -> None:
     """Обрабатывает inline-запрос @bot @<user1> @<user2> …."""
     targets = parse_inline_targets(inline.query)
     uid = str(inline.from_user.id)
-    bot = bot_username_at()
+    bot_at = bot_username_at()
 
     # Пустой target / hint
     if not targets:
@@ -276,7 +253,7 @@ async def handle(inline: InlineQuery) -> None:
                     id_="profile_hint",
                 ),
             ],
-            cache_time=60,
+            cache_time=INLINE_CACHE_DEFAULT,
             is_personal=True,
         )
         return
@@ -293,7 +270,7 @@ async def handle(inline: InlineQuery) -> None:
                     id_="profile_need_session",
                 ),
             ],
-            cache_time=5,
+            cache_time=INLINE_CACHE_LOCKED,
             is_personal=True,
             button=connect_button(),
         )
@@ -303,7 +280,7 @@ async def handle(inline: InlineQuery) -> None:
     if not client:
         await inline.answer(
             results=[],
-            cache_time=5,
+            cache_time=INLINE_CACHE_LOCKED,
             is_personal=True,
         )
         return
@@ -364,12 +341,12 @@ async def handle(inline: InlineQuery) -> None:
     if not results:
         await inline.answer(
             results=[],
-            cache_time=5,
+            cache_time=INLINE_CACHE_LOCKED,
             is_personal=True,
         )
         return
 
-    cache = CACHE_TIME_SINGLE if len(results) == 1 else CACHE_TIME_MULTI
+    cache = INLINE_CACHE_PROFILE if len(results) == 1 else INLINE_CACHE_PROFILE_MULTI
     await inline.answer(
         results=results,
         cache_time=cache,

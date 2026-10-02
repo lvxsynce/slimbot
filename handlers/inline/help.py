@@ -17,9 +17,11 @@ from aiogram.types import (
 )
 
 from utils.bot_info import bot_username_at, bot_mention_html
+from utils.escape import esc as _esc
+from utils.inline_kb import connect_button
 from utils.storage import session_exists
 
-from . import connect_button
+from config import INLINE_CACHE_HELP, INLINE_CACHE_LOCKED, INLINE_CACHE_DEFAULT
 
 
 HELP_KEYWORDS = ("помощь", "help", "справка", "h", "?")
@@ -46,7 +48,9 @@ def _overview_text() -> str:
          "внутри чатов: <code>.ping</code>, <code>.time</code>, <code>.id</code>, "
          "<code>.net</code>, "
         "<code>.tr</code>, <code>.calc</code>, <code>.hash</code>, <code>.watch</code>.\n\n"
-        f"<i>Открой личку с {link} → <b>/start</b>, чтобы увидеть весь список.</i>"
+        f"<i>Кнопка «Включить inline» в личке с {link} открывает inline в любом чате "
+        f"(её также можно не нажимать — Telegram подставляет <code>{bot}</code> сам). "
+        f"Весь список команд — по <b>/start</b>.</i>"
     )
 
 
@@ -60,6 +64,21 @@ def _unauth_text() -> str:
         "2. Нажми <b>/start</b>\n"
         "3. Следуй инструкциям\n\n"
         "<i>Подключение занимает минуту.</i>"
+    )
+
+
+def _hint_text(query: str) -> str:
+    """Карточка для нераспознанного запроса.
+
+    Раньше диспетчер отвечал `results=[]` — в списке не появлялось
+    ничего, и юзер не понимал, что можно было написать. Теперь тот же
+    текст справки + эхо его запроса.
+    """
+    shown = _esc(query) if query.strip() else "—"
+    return (
+        "<b>🤷 Не понял запрос</b>\n\n"
+        f"Ты написал: <code>{shown}</code>\n\n"
+        f"{_overview_text()}"
     )
 
 
@@ -97,7 +116,7 @@ async def handle(inline: InlineQuery) -> None:
                     id_="help_unauthorized",
                 ),
             ],
-            cache_time=30,
+            cache_time=INLINE_CACHE_LOCKED,
             is_personal=True,
             button=connect_button(),
         )
@@ -112,6 +131,30 @@ async def handle(inline: InlineQuery) -> None:
                 id_="help_main",
             ),
         ],
-        cache_time=300,
+        cache_time=INLINE_CACHE_HELP,
         is_personal=True,
+    )
+
+
+async def handle_hint(inline: InlineQuery) -> None:
+    """Ответ на нераспознанный запрос: не пустой список, а подсказка.
+
+    Здесь авторизации нет намеренно — подсказка полезна и без сессии,
+    а `connect_button` её не мешает: он просто ведёт в личку на /start.
+    """
+    query = (inline.query or "").strip()
+    bot = bot_username_at()
+    shown = query if len(query) <= 40 else query[:40] + "…"
+    await inline.answer(
+        results=[
+            _make_article(
+                title=f"Не знаю такой команды: {shown}",
+                description=f"Что умеет {bot} — покажу справку.",
+                text=_hint_text(query),
+                id_="help_unknown_query",
+            ),
+        ],
+        cache_time=INLINE_CACHE_DEFAULT,
+        is_personal=True,
+        button=connect_button(),
     )

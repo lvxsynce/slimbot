@@ -27,6 +27,11 @@ knowledge_settings.json
 templates.json
 templates/
 
+# Модули пользователей: исходники (.py — это исполняемый код!) + метаданные.
+modules.json
+modules/
+module_state/
+
 # Telethon-сессии (каждый .session — это авторизация).
 sessions/
 *.session

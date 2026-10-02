@@ -28,6 +28,7 @@ Telegram рендерит оба варианта как inline-playable preview
 - normal → результат отправлен reply'ем на ОРИГИНАЛЬНОЕ media, исходная команда
   удалена.
 """
+from utils.cmds import VGF_CMDS
 
 import asyncio
 import io
@@ -36,7 +37,7 @@ import logging
 from telethon.tl.types import DocumentAttributeAnimated
 from handlers.commands._base import command_card
 
-VGF_CMDS = (".вгф", ".vfg", ".gif")
+
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +60,6 @@ def _media_size_bytes(reply) -> int | None:
         return int(getattr(document, "size", 0) or 0)
     return None
 
-
-def _check(t: str | None) -> bool:
-    if not t:
-        return False
-    head = t.strip().lower().split()[0]
-    return head in VGF_CMDS
 
 
 async def handle(user_id: str, event) -> None:

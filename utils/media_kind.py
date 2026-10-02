@@ -18,6 +18,8 @@
 from __future__ import annotations
 
 import logging
+
+from utils.escape import esc as _esc
 import os
 from dataclasses import dataclass
 
@@ -117,11 +119,6 @@ KIND_ORDER = (
 
 #: Насколько «заметный» тип при сортировке списка (меньше — выше).
 KIND_RANK = {k: i for i, k in enumerate(KIND_ORDER)}
-
-
-def _esc(s) -> str:
-    import html as _html
-    return _html.escape(str(s if s is not None else ""))
 
 
 def icon(kind: str, *, premium: bool = False) -> str:

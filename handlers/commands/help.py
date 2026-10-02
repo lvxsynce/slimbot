@@ -4,6 +4,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from ._base import command_card, format_help, render_help, thread_kwargs
 from ._base import _help_base_lines, _help_session_lines
+from utils.inline_kb import with_inline_hint
 from utils.storage import session_exists
 
 router = Router()
@@ -36,20 +37,21 @@ def _render_section(key: str) -> str:
 
 
 def help_keyboard(has_session: bool = False) -> InlineKeyboardMarkup:
+    """Клавиатура /help. Последняя строка — inline-подсказка (`utils.inline_kb`)."""
     section_row = [
         InlineKeyboardButton(text=t, callback_data=f"helpsec:{k}")
         for k, t in (("base", "База"), ("session", "Сессия"), ("ai", "ИИ"))
     ]
     if has_session:
-        return InlineKeyboardMarkup(inline_keyboard=[
+        return with_inline_hint(InlineKeyboardMarkup(inline_keyboard=[
             section_row,
             [InlineKeyboardButton(text="[?] Зачем это", callback_data="w1")],
-        ])
-    return InlineKeyboardMarkup(inline_keyboard=[
+        ]))
+    return with_inline_hint(InlineKeyboardMarkup(inline_keyboard=[
         section_row,
         [InlineKeyboardButton(text="[+] Включить", callback_data="c1")],
         [InlineKeyboardButton(text="[?] Зачем это", callback_data="w1")],
-    ])
+    ]))
 
 
 @router.callback_query(F.data.startswith("helpsec:"))
@@ -63,9 +65,9 @@ async def helpsec_cb(callback: types.CallbackQuery):
         kb = help_keyboard(has_ss)
     else:
         text = _render_section(key)
-        kb = InlineKeyboardMarkup(inline_keyboard=[
+        kb = with_inline_hint(InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="[<-] Всё", callback_data="helpsec:all")],
-        ])
+        ]))
     try:
         await callback.message.edit_text(text, reply_markup=kb)
     except Exception:

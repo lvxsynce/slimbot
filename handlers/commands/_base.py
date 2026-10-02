@@ -1,30 +1,95 @@
 from datetime import datetime, timezone
 import re
 
+from utils.bot_info import bot_username_at
 from utils.timezones import format_with_tz
 from utils.texts import Texts, render_for_user
+
+
+#: Telegram отклоняет сообщения длиннее 4096 символов, а ошибка отправки
+#: проглатывалась вызывающим кодом — пользователь просто видел команду без
+#: ответа. Здесь режем заранее, сохраняя валидный HTML.
+TELEGRAM_MAX_MESSAGE = 4096
+#: Запас на суффикс, который дописывается при обрезке.
+TRUNCATE_HEADROOM = 64
+_TRUNCATE_HEADROOM = TRUNCATE_HEADROOM
+
+
+#: Теги, которые мы умеем закрывать при обрезке.
+_CLOSABLE = ("code", "b", "i", "s", "u", "a", "blockquote")
+
+
+def _utf16_len(text: str) -> int:
+    """Длина строки в UTF-16 code units — ровно то, что считает Telegram.
+
+    ``len()`` даёт code points, а для emoji (astral, 2 code units каждый)
+    расходится вдвое: карточка на 3071 code points = 6072 UTF-16 units,
+    и Telegram её отвергнет.
+    """
+    return len(text.encode("utf-16-le", errors="replace")) // 2
+
+
+def _truncate(text: str, limit: int = TELEGRAM_MAX_MESSAGE) -> str:
+    """Обрезать до лимита Telegram по UTF-16, не разрывая HTML-теги.
+
+    Режем по code point'ам, но проверяем результат по UTF-16 — и продолжаем
+    резать, пока не влезем. Плюс баланс тегов: незакрытый ``<code>`` делает
+    карточку невалидной, и Telegram вернёт BadRequest — пользователь снова
+    ничего не увидит.
+    """
+    if _utf16_len(text) <= limit:
+        return text
+    # Режем бинарным поиском по code point'ам: '_utf16_len' монотонна.
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _utf16_len(text[:mid]) <= limit - _TRUNCATE_HEADROOM:
+            lo = mid
+        else:
+            hi = mid - 1
+    clipped = text[:lo]
+
+    # Отрезаем хвост, если он попал внутрь открывающего тега.
+    last_lt = clipped.rfind("<")
+    if last_lt != -1 and ">" not in clipped[last_lt:]:
+        clipped = clipped[:last_lt]
+
+    for tag in _CLOSABLE:
+        opens = len(re.findall(rf"<{tag}(?:\s[^>]*)?>", clipped))
+        closes = len(re.findall(rf"</{tag}>", clipped))
+        clipped += f"</{tag}>" * max(0, opens - closes)
+
+    return clipped.rstrip() + "\n<i>…обрезано.</i>"
+
+
+_LEGACY_HEADER_RE = re.compile(r"^<b>Slim bot \| [^<]+</b>\s*")
+_WRAPPED_QUOTE_RE = re.compile(r"<blockquote(?:\s+[^>]*)?>([\s\S]*)</blockquote>")
+
+
+def _unwrap_legacy(body: str) -> str:
+    """Снять legacy-обёртку: старые хендлеры уже собирали карточку сами.
+
+    Некоторые клали header внутрь quote, другие — снаружи. Снимаем и то и
+    то, пока не останется голое тело. Раньше этот цикл был продублирован
+    дважды подряд в одной функции, причём вторая копия была мёртвой.
+    """
+    previous = None
+    while previous != body:
+        previous = body
+        body = _LEGACY_HEADER_RE.sub("", body).strip()
+        match = _WRAPPED_QUOTE_RE.fullmatch(body)
+        if match:
+            body = match.group(1).strip()
+    return body
 
 
 def command_card(title: str, body: str, *, expandable: bool = False) -> str:
     """Build the single HTML layout used by command responses."""
     title = str(title).strip()
-    body = str(body or "").strip()
-    body = re.sub(r"^<b>Slim bot \| [^<]+</b>\s*", "", body)
-    while True:
-        match = re.fullmatch(r"<blockquote(?:\s+[^>]*)?>([\s\S]*)</blockquote>", body)
-        if not match:
-            break
-        body = match.group(1).strip()
-    # A few older handlers put the Slim bot header inside the quote. Remove it
-    # before adding the canonical header outside the quote.
-    body = re.sub(r"^<b>Slim bot \| [^<]+</b>\s*", "", body)
-    while True:
-        match = re.fullmatch(r"<blockquote(?:\s+[^>]*)?>([\s\S]*)</blockquote>", body)
-        if not match:
-            break
-        body = match.group(1).strip()
+    body = _unwrap_legacy(str(body or "").strip())
     tag = "<blockquote expandable>" if expandable else "<blockquote>"
-    return f"<b>Slim bot | {title}</b>\n{tag}{body}</blockquote>"
+    card = f"<b>Slim bot | {title}</b>\n{tag}{body}</blockquote>"
+    return _truncate(card, TELEGRAM_MAX_MESSAGE)
 
 
 def normalize_command_card(text: str, title: str = "Result") -> str:
@@ -37,65 +102,21 @@ def command_response(title: str, text: str) -> str:
     return normalize_command_card(text, title)
 
 
-def format_ping(message_date) -> str:
-    """``.ping`` — задержка между отправкой и обработкой.
-
-    Возвращает готовый HTML с unicode-эмодзи (НЕ premium-aware). Для premium
-    используй :func:`render_ping` (async, принимает uid).
-    """
-    now = datetime.now(timezone.utc)
-    dt = message_date
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    ping_ms = int((now - dt).total_seconds() * 1000)
-    return Texts.Ping.PING.render(premium=False, ms=str(ping_ms))
-
-
-async def render_ping(user_id, message_date) -> str:
-    """``.ping`` — рендер с premium-aware эмодзи для данного юзера."""
-    now = datetime.now(timezone.utc)
-    dt = message_date
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    ping_ms = int((now - dt).total_seconds() * 1000)
-    return await render_for_user(user_id, Texts.Ping.PING, ms=str(ping_ms))
-
-
-def format_time(user_id: str | int | None = None) -> str:
-    """``.time`` — текущее время. ``user_id`` → TZ юзера; ``None`` → UTC.
-
-    Unicode-эмодзи (НЕ premium-aware). Для premium используй :func:`render_time`.
-    """
-    from utils.storage import get_user_tz
-    tz_label = get_user_tz(user_id) if user_id is not None else None
-    now_str, _ = format_with_tz(tz_label)
-    return Texts.Time.TIME.render(premium=False, now=now_str)
 
 
 async def render_time(user_id, *, tz_label: str | None = None) -> str:
-    """``.time`` — рендер с TZ + premium-aware эмодзи."""
+    """``.time`` — рендер с TZ + premium-aware эмодзи.
+
+    Карточка целиком (header + ``<blockquote>``) собирается здесь, чтобы
+    был ровно ОДИН blockquote. Раньше ``Texts.Time.TIME`` оборачивал уже
+    готовую карточку из ``format_with_tz`` — получался вложенный blockquote,
+    который Telegram отклоняет.
+    """
     from utils.storage import get_user_tz
     label = tz_label if tz_label is not None else (get_user_tz(user_id) if user_id is not None else None)
     now_str, _ = format_with_tz(label)
-    return await render_for_user(user_id, Texts.Time.TIME, now=now_str)
-
-
-def format_id(chat_id, user_id, username, first_name, thread_id=None) -> str:
-    """``.id`` — ID чата + юзера + топика + username.
-
-    Unicode-эмодзи (НЕ premium-aware). User-controlled данные (username/name)
-    экранируются. Для premium используй :func:`render_id`.
-    """
-    from utils.escape import esc
-    topic_line = f"\n• Topic ID: <code>{int(thread_id)}</code>" if thread_id else ""
-    return Texts.ID.INFO.render(
-        premium=False,
-        chat_id=str(chat_id),
-        topic_line=topic_line,
-        user_id=str(user_id),
-        username=esc(username or "нет"),
-        name=esc(first_name or ""),
-    )
+    body = await render_for_user(user_id, Texts.Time.TIME, now=now_str)
+    return command_card("Time", body)
 
 
 async def render_id(owner_id, *, chat_id, user_id, username, first_name, thread_id=None) -> str:
@@ -199,10 +220,25 @@ def _help_session_lines() -> list[str]:
     ]
 
 
+def _help_inline_lines() -> list[str]:
+    """Inline-команды — работают в любом чате, где юзер набирает @username."""
+    b = bot_username_at()
+    return [
+        f"• <code>{b} помощь</code> — справка по inline",
+        f"• <code>{b} статус</code> — аптайм, пинг, нагрузка",
+        f"• <code>{b} @username</code> — карточка профиля (нужна сессия)",
+    ]
+
+
 def _help_lines(has_session: bool) -> list[str]:
     """Единый текст справки: полный список всегда, состояние сессии
     меняет только заголовок раздела и хинт внизу."""
     lines = _help_base_lines()
+    lines += [
+        "",
+        "<b>Inline</b> — в любом чате (кнопка «Включить inline» в <code>/start</code>):",
+        *_help_inline_lines(),
+    ]
     lines += [
         "",
         "<b>Дополнительно:</b>" if has_session else "<b>Дополнительно (нужна сессия):</b>",

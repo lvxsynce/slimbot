@@ -64,6 +64,7 @@ from utils.storage import (
     session_exists,
 )
 from utils.rate_limit import allow
+from utils.tlm_common import thread_id_of as tlm_thread_id_of
 from utils.escape import sanitize_llm_html
 
 
@@ -213,14 +214,18 @@ def _is_reset_all(third: str) -> bool:
 
 
 async def _do_reset(user_id: str, chat_id: int, reset_all: bool, thread_id: int = 0) -> str:
+    # Сброс обязан быть долговечным сразу: пользователь ждёт, что история
+    # реально стёрта (и не вернётся после рестарта).
     if reset_all:
         count = ai_memory.clear_all(user_id)
+        await ai_memory.flush()
         return (
             f"[OK] Сброшена история во всех чатах "
             f"(<code>{count}</code> диалогов)."
         )
     size = ai_memory.size(user_id, chat_id, thread_id)
     ai_memory.clear(user_id, chat_id, thread_id)
+    await ai_memory.flush()
     return f"[OK] История диалога сброшена (<code>{size}</code> сообщений)."
 
 
@@ -232,20 +237,6 @@ def _context_message(label: str, content: str) -> dict:
         "role": "user",
         "content": f"<untrusted_{label}>\n{safe_content}\n</untrusted_{label}>",
     }
-
-
-def _message_thread_id(message) -> int:
-    """Return a Telethon message's forum topic id, or zero outside topics."""
-    reply_to = getattr(message, "reply_to", None)
-    if not reply_to:
-        return 0
-    top_id = getattr(reply_to, "reply_to_top_id", None)
-    if top_id:
-        return int(top_id)
-    if getattr(reply_to, "forum_topic", False):
-        root_id = getattr(reply_to, "reply_to_msg_id", None)
-        return int(root_id) if root_id else 0
-    return 0
 
 
 
@@ -299,8 +290,10 @@ async def _do_knowledge(user_id: str, rest: str, client=None) -> str:
     if not arg:
         return "[i] Управление базой доступно в личке с ботом: <code>.ии база</code>."
     if word in KNOWLEDGE_STATUS_WORDS:
-        state = knowledge_db.get_collection(user_id)
-        total = knowledge_db.count_messages(user_id)
+        # Через run_db: count_messages на большой базе — сотни мс синхронной
+        # работы, которые иначе встали бы на весь event loop.
+        state = await knowledge_db.run_db(knowledge_db.get_collection, user_id)
+        total = await knowledge_db.run_db(knowledge_db.count_messages, user_id)
         if not state:
             return "[i] База ещё не собиралась. <code>.ии база</code> запустит сбор."
         status = {
@@ -329,7 +322,10 @@ async def _do_knowledge(user_id: str, rest: str, client=None) -> str:
     selected_chats = get_knowledge_selected_chats(user_id)
     if not selected_chats:
         return "[?] Выбери чаты для базы в личке с ботом: <code>.ии база</code>."
-    items = knowledge_db.search(user_id, arg, limit=KNOWLEDGE_SEARCH_LIMIT, chat_ids=selected_chats)
+    items = await knowledge_db.run_db(
+        knowledge_db.search, user_id, arg,
+        limit=KNOWLEDGE_SEARCH_LIMIT, chat_ids=selected_chats,
+    )
     if not items:
         return "[i] В базе ничего не найдено. Запусти <code>.ии база</code> или уточни запрос."
     context_lines = []
@@ -528,7 +524,7 @@ async def _regex_search(
     try:
         async for m in client.iter_messages(chat_id, limit=AI_REGEX_SEARCH_SCAN_LIMIT):
             text = (m.raw_text or m.message or "")
-            if not text or (thread_id and _message_thread_id(m) != thread_id):
+            if not text or (thread_id and tlm_thread_id_of(m) != thread_id):
                 continue
             texts.append((m, text))
     except Exception as e:
@@ -1043,31 +1039,6 @@ async def _do_ai_aiogram(
     if summary:
         history = [_context_message("memory_summary", summary), *history]
 
-    if not query and not reply_text and not image_bytes:
-        hsize = len(history)
-        if hsize:
-            return (
-                "[?] Использование:\n"
-                "<code>.ии вопрос</code> — вопрос с памятью диалога\n"
-                "<code>.ии</code> (reply) — ответ про сообщение\n"
-                "<code>.ии</code> (reply на фото) — анализ картинки\n"
-                "<code>.ии сброс</code> — очистить историю\n"
-                "<code>.ии база</code> — собрать переписки\n"
-                "<code>.ии база вопрос</code> — поиск по базе\n"
-            "\n<i>LLM сам вызовет .regex / .tr / .net когда нужны данные.</i>\n"
-                + f"\n[i] История: <code>{hsize}</code> сообщений."
-            )
-        return (
-            "[?] Использование:\n"
-            "<code>.ии вопрос</code> — просто вопрос\n"
-            "<code>.ии</code> (reply) — ответ про сообщение\n"
-            "<code>.ии</code> (reply на фото) — анализ картинки\n"
-            "<code>.ии сброс</code> — очистить историю\n"
-            "<code>.ии база</code> — собрать переписки\n"
-            "<code>.ии база вопрос</code> — поиск по базе\n"
-            "<code>.ии дебаг</code> — список тулов в ответе (только в чатах)"
-        )
-
     if image_bytes:
         prompt = query or VISION_DEFAULT
         context = history if history else None
@@ -1103,6 +1074,7 @@ async def _do_ai_aiogram(
     )
 
     hsize = ai_memory.size(user_id, chat_id, thread_id)
+    await ai_memory.flush()
     return _format_ai_response(
         cleaned=cleaned_answer, tool_log=[], is_debug=False,
         history_size=hsize,
@@ -1184,21 +1156,11 @@ async def cmd_ai_private(message: types.Message):
 
     if not query and not reply_text and not img:
         hsize = ai_memory.size(uid, cid, tid)
-        lines = [
-            "<code>.ии вопрос</code> — вопрос с памятью диалога",
-            "<code>.ии</code> (reply) — ответ про сообщение",
-            "<code>.ии</code> (reply на фото) — анализ картинки",
-            "<code>.ии сброс</code> — очистить историю",
-            "<code>.ии база</code> — собрать переписки",
-            "<code>.ии база вопрос</code> — поиск по базе",
-            "<code>.ии дебаг вопрос</code> — то же + список тулов (только в чатах)",
-            "<code>.ии ctx=N вопрос</code> — N сообщений вокруг реплая (только в чатах)",
-            "<i>LLM сам вызовет .regex / .tr / .net.</i>",
-        ]  
-        if hsize:
-            lines.append(f"\n[i] История: <code>{hsize}</code> сообщений.")
+        from utils.shared_cmd import ai_usage_hint
         await message.reply(
-            "[?] Использование:\n" + "\n".join(lines),
+            "[?] Использование:\n" + ai_usage_hint(
+                has_session=False, history_size=hsize,
+            ),
             parse_mode="html",
             **thread_kwargs(message),
         )
@@ -1283,7 +1245,7 @@ async def _collect_context_safe(
                 if m and m.id != center_id and (m.raw_text or m.message):
                     msgs.append(m)
         if thread_id:
-            msgs = [m for m in msgs if _message_thread_id(m) == thread_id]
+            msgs = [m for m in msgs if tlm_thread_id_of(m) == thread_id]
         unique = {m.id: m for m in msgs}
         msgs = list(unique.values())
         msgs.sort(key=lambda x: x.id)
@@ -1423,7 +1385,7 @@ async def handle(user_id: str, event):
     """
     raw = (event.raw_text or "").strip()
     chat_id = event.chat_id
-    thread_id = _message_thread_id(getattr(event, "message", event))
+    thread_id = tlm_thread_id_of(getattr(event, "message", event))
     _ai_lock_key = (str(user_id), int(chat_id), thread_id)
     lock = _AI_LOCKS[_ai_lock_key]
     if lock.locked():
@@ -1466,21 +1428,13 @@ async def _handle_locked(user_id: str, event, raw: str, chat_id: int, thread_id:
     # Empty usage hint
     if not effective_query and not reply:
         hsize = ai_memory.size(user_id, chat_id, thread_id)
-        lines = [
-            "<code>.ии вопрос</code> — вопрос с памятью диалога",
-            "<code>.ии</code> (reply) — ответ про сообщение",
-            "<code>.ии</code> (reply на фото) — анализ картинки",
-            "<code>.ии сброс</code> — очистить историю",
-            "<code>.ии база</code> — собрать переписки",
-            "<code>.ии база вопрос</code> — поиск по базе",
-            "<code>.ии дебаг вопрос</code> — то же + список тулов в ответе",
-            "<code>.ии ctx=N вопрос</code> — N сообщений вокруг реплая (по умолчанию 20)",
-            "<i>LLM сам вызовет .regex / .tr / .net когда нужны данные.</i>",
-        ]
-        if hsize:
-            lines.append(f"\n[i] История: <code>{hsize}</code> сообщений.")
+        from utils.shared_cmd import ai_usage_hint
+        from config import AI_CONTEXT_LEN_DEFAULT
         await event.edit(
-            "[?] Использование:\n" + "\n".join(lines),
+            "[?] Использование:\n" + ai_usage_hint(
+                has_session=True, ctx_default=AI_CONTEXT_LEN_DEFAULT,
+                history_size=hsize,
+            ),
             parse_mode="html",
         )
         return
@@ -1588,6 +1542,11 @@ async def _handle_locked(user_id: str, event, raw: str, chat_id: int, thread_id:
         (cleaned or "")[:2000],
         thread_id,
     )
+
+    # Гарантируем долговечность памяти перед отправкой ответа: если процесс
+    # умрёт сразу после edit, юзер не должен потерять только что записанный
+    # обмен (раньше он писался синхронно, ценой 1.5 с блокировки loop).
+    await ai_memory.flush()
 
     hsize = ai_memory.size(user_id, chat_id, thread_id)
     # Финальный вывод — единая HTML-обёртка <blockquote> (визуально

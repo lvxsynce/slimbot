@@ -24,14 +24,96 @@ from config import (
     AUTH_ATTEMPT_WINDOW,
     AUTH_COOLDOWN,
     AUTH_MAX_ATTEMPTS,
+    SESSION_ALLOWLIST,
 )
+from utils.premium import invalidate_premium_cache
 from utils.storage import user_sessions, save_user_sessions, session_path
 from utils.telethon_manager import auth_states, telethon_manager
 
 logger = logging.getLogger(__name__)
 router = Router()
+
+#: uid -> время последней активности (для prune обоих словарей).
+_AUTH_SEEN: dict[str, float] = {}
 _AUTH_LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
 _AUTH_ATTEMPTS: dict[str, deque[float]] = defaultdict(deque)
+
+#: Порог, после которого подчищаем словари. Раньше порог был только у
+#: `_AUTH_ATTEMPTS`, а `_AUTH_LOCKS` (создаётся на КАЖДОМ чтении
+#: `_AUTH_LOCKS[uid]` в трёх местах) рос бесконечно: по одному Lock на
+#: каждого юзера, который хотя бы раз коснулся аутентификации.
+_AUTH_PRUNE_THRESHOLD = 2000
+_AUTH_PRUNE_KEEP = 1000
+
+
+def _prune_auth_state(now: float) -> int:
+    """Вычистить истёкшие записи обоих auth-словарей.
+
+    Два независимых признака устаревания:
+
+    * ``_AUTH_SEEN[uid]`` старше окна — юзер давно не появлялся, поэтому
+      ни Lock, ни очередь попыток ему не нужны;
+    * сама очередь ``_AUTH_ATTEMPTS[uid]`` пуста или протухла (в т.ч.
+      записи, попавшие в словарь мимо ``_touch_auth_state``).
+
+    Плюс аварийный потолок: даже если что-то формально не протухло,
+    словари не дают расти бесконечно.
+
+    Возвращает число удалённых записей.
+    """
+    removed = 0
+
+    for uid in list(_AUTH_SEEN):
+        if now - _AUTH_SEEN[uid] <= AUTH_ATTEMPT_WINDOW:
+            continue
+        _AUTH_SEEN.pop(uid, None)
+        if _AUTH_LOCKS.pop(uid, None) is not None:
+            removed += 1
+        if _AUTH_ATTEMPTS.pop(uid, None) is not None:
+            removed += 1
+
+    for uid, queue in list(_AUTH_ATTEMPTS.items()):
+        while queue and now - queue[0] > AUTH_ATTEMPT_WINDOW:
+            queue.popleft()
+        if not queue:
+            _AUTH_ATTEMPTS.pop(uid, None)
+            _AUTH_SEEN.pop(uid, None)
+            if _AUTH_LOCKS.pop(uid, None) is not None:
+                removed += 1
+            removed += 1
+
+    while max(len(_AUTH_SEEN), len(_AUTH_ATTEMPTS), len(_AUTH_LOCKS)) > _AUTH_PRUNE_KEEP:
+        uid = next(iter(_AUTH_SEEN))
+        _AUTH_SEEN.pop(uid, None)
+        if _AUTH_LOCKS.pop(uid, None) is not None:
+            removed += 1
+        if _AUTH_ATTEMPTS.pop(uid, None) is not None:
+            removed += 1
+
+    return removed
+
+
+def _auth_lock(uid: str) -> asyncio.Lock:
+    """Per-user блокировка аутентификации.
+
+    Оборачивает defaultdict: помимо создания Lock'а отмечает активность,
+    чтобы prune знал, какие записи ещё нужны. Раньше здесь стояло
+    `_AUTH_LOCKS[uid]` напрямую — чтение defaultdict СОЗДАВАЛО запись, и она
+    жила до конца процесса.
+    """
+    lock = _AUTH_LOCKS[uid]
+    _touch_auth_state(uid, time.monotonic())
+    return lock
+
+
+def _touch_auth_state(uid: str, now: float) -> None:
+    """Отметить активность юзера и устроить prune при необходимости."""
+    _AUTH_SEEN[uid] = now
+    # Порог считаем по ОБОИМ словарям: попытки могут попасть в
+    # _AUTH_ATTEMPTS и мимо _AUTH_SEEN (например, в тестах или при
+    # восстановлении после рестарта), и тогда один рос бы незаметно.
+    if max(len(_AUTH_SEEN), len(_AUTH_ATTEMPTS), len(_AUTH_LOCKS)) > _AUTH_PRUNE_THRESHOLD:
+        _prune_auth_state(now)
 
 
 def _allow_auth_attempt(uid: str) -> bool:
@@ -44,32 +126,37 @@ def _allow_auth_attempt(uid: str) -> bool:
             _AUTH_ATTEMPTS.pop(uid, None)
             attempts = None
     if attempts:
+        _touch_auth_state(uid, now)
         if now - attempts[-1] < AUTH_COOLDOWN:
             return False
         if len(attempts) >= AUTH_MAX_ATTEMPTS:
             return False
         attempts.append(now)
         return True
-    if len(_AUTH_ATTEMPTS) > 2000:
-        _prune_auth_attempts(now)
+    _touch_auth_state(uid, now)
     _AUTH_ATTEMPTS[uid].append(now)
     return True
 
 
-def _prune_auth_attempts(now: float) -> None:
-    """Удаляет протухшие/пустые записи лимитера (защита от роста словаря)."""
-    for key in list(_AUTH_ATTEMPTS):
-        queue = _AUTH_ATTEMPTS[key]
-        while queue and now - queue[0] > AUTH_ATTEMPT_WINDOW:
-            queue.popleft()
-        if not queue:
-            _AUTH_ATTEMPTS.pop(key, None)
-        if len(_AUTH_ATTEMPTS) <= 1000:
-            break
-
-
 def _rand_delay():
     return secrets.randbelow(2000) / 1000 + 0.3
+
+
+def session_allowed(uid: str) -> bool:
+    """Разрешено ли этому uid подключать Telethon-сессию.
+
+    Пустой SESSION_ALLOWLIST = открытый режим (обратная совместимость
+    одиночного использования). Непустой = только перечисленные id; это
+    обязательный гейт для публичного бота, иначе любой, кто его нашёл,
+    подключает свой аккаунт и получает доступ к общему LLM-ключу.
+    """
+    if not SESSION_ALLOWLIST:
+        return True
+    return str(uid) in SESSION_ALLOWLIST
+
+
+def allowlist_active() -> bool:
+    return bool(SESSION_ALLOWLIST)
 
 
 WHY_TEXT = (
@@ -165,6 +252,16 @@ async def back_cb(callback: types.CallbackQuery):
 @router.callback_query(lambda c: c.data == "c1")
 async def connect_cb(callback: types.CallbackQuery):
     uid = str(callback.from_user.id)
+    if not session_allowed(uid):
+        logger.warning("connect: uid=%s rejected (not in SESSION_ALLOWLIST)", uid)
+        await callback.answer("Подключение недоступно", show_alert=True)
+        return
+    if not allowlist_active():
+        # Открытый режим — это осознанный выбор оператора, но о нём стоит
+        # знать: любой нашедший бота может подключить свой аккаунт.
+        logger.warning(
+            "connect: uid=%s accepted in OPEN mode (SESSION_ALLOWLIST is empty)", uid
+        )
     logger.info(f"connect: uid={uid}")
     if uid in auth_states and auth_states[uid].get("step") in {"code", "2fa", "starting"}:
         await callback.answer("Подключение уже выполняется")
@@ -234,7 +331,7 @@ async def phone_kb(callback: types.CallbackQuery):
         if len(raw) < 8:
             await callback.answer("[x] Слишком короткий номер")
             return
-        async with _AUTH_LOCKS[uid]:
+        async with _auth_lock(uid):
             if uid not in auth_states or auth_states[uid].get("step") != "phone":
                 return
             if not _allow_auth_attempt(uid):
@@ -247,6 +344,12 @@ async def phone_kb(callback: types.CallbackQuery):
 
 
 async def _start_auth(msg, uid: str, phone: str):
+    # Повторная проверка: между connect_cb и этим вызовом мог измениться
+    # allowlist (перезапуск) — не даём зайти через уже созданное состояние.
+    if not session_allowed(uid):
+        auth_states.pop(uid, None)
+        await msg.answer("[x] Подключение недоступно.")
+        return
     logger.info(f"_start_auth: creating client for {uid}")
     await asyncio.sleep(_rand_delay())
     client = TelegramClient(session_path(uid), API_ID, API_HASH)
@@ -339,7 +442,7 @@ async def code_kb(callback: types.CallbackQuery):
         if not val:
             await callback.answer("Сначала введи цифры")
             return
-        async with _AUTH_LOCKS[uid]:
+        async with _auth_lock(uid):
             if auth_states.get(uid) is not state or state.get("step") != "code":
                 return
             if not _allow_auth_attempt(uid):
@@ -353,11 +456,13 @@ async def code_kb(callback: types.CallbackQuery):
         try:
             await client.sign_in(state["phone"], val, phone_code_hash=state["hash"])
             logger.info(f"code: sign_in ok for {uid}")
-            await _finish(uid, client, state["phone"], twofa=False)
+            started = await _finish(uid, client, state["phone"], twofa=False)
             await callback.message.answer(
                 "[OK] <b>Готово!</b>\n\n"
                 "Команды работают во всех чатах.\n"
                 "Одноразовые фото будут сохраняться."
+                if started
+                else "[x] Не удалось запустить сессию. Начни подключение заново: /start"
             )
         except SessionPasswordNeededError:
             logger.info(f"code: 2fa needed for {uid}")
@@ -424,21 +529,27 @@ async def twofa_handler(message: types.Message):
     pw = message.text.strip()
     logger.info(f"2fa: uid={uid}")
     client = state["client"]
-    async with _AUTH_LOCKS[uid]:
+    async with _auth_lock(uid):
         if auth_states.get(uid) is not state or state.get("step") != "2fa":
             return
         if not _allow_auth_attempt(uid):
+            await _erase_password(message)
             await message.reply("Слишком много попыток. Подожди немного.")
             return
         state["step"] = "verifying"
+    # Сразу удаляем сообщение с паролем: он не должен оставаться в истории
+    # чата (ни в облаке, ни у других участников — в личке это всё равно он сам).
+    await _erase_password(message)
     try:
         await client.sign_in(password=pw)
         logger.info(f"2fa: ok for {uid}")
-        await _finish(uid, client, state["phone"], twofa=True)
+        started = await _finish(uid, client, state["phone"], twofa=True)
         await message.reply(
             "[OK] <b>Готово!</b>\n\n"
             "Команды работают во всех чатах.\n"
             "Одноразовые фото будут сохраняться."
+            if started
+            else "[x] Не удалось запустить сессию. Начни подключение заново: /start"
         )
     except PasswordHashInvalidError:
         logger.warning(f"2fa: wrong password for {uid}")
@@ -458,18 +569,54 @@ async def twofa_handler(message: types.Message):
         auth_states.pop(uid, None)
 
 
+async def _erase_password(message: types.Message) -> None:
+    """Удалить сообщение с облачным паролем.
+
+    Бот может удалять собственные сообщения в личке, а пароль 2FA — это
+    полноценный секрет, который не должен валяться в истории переписки.
+    Отказ удаления не критичен (например, слишком старое сообщение), поэтому
+    ошибку глушим.
+    """
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.debug("session: could not delete 2FA password message: %s", e)
+
+
 async def _finish(uid: str, client: TelegramClient, phone: str, twofa: bool = False):
     logger.info(f"_finish: uid={uid} twofa={twofa}")
     me = await client.get_me()
     await client.disconnect()
+    auth_states.pop(uid, None)
+
+    # Поднимаем клиент ДО записи, чтобы status отражал реальность: при неудаче
+    # юзер не должен видеть «Готово» и «Включено».
+    started = await telethon_manager.start_client(uid)
+
+    # НО: sign_in уже создал валидный .session файл. Если записи в
+    # user_sessions нет, `cleanup_orphan_sessions()` на следующем старте
+    # удалит его как «сироту» — и юзеру придётся проходить аутентификацию
+    # заново из-за сетевого сбоя. Поэтому при неудаче пишем status:
+    # "pending" (не active ⇒ session_exists() == False ⇒ UI честен), но
+    # файл защищён от удаления.
+    status = "active" if started else "pending"
     user_sessions[uid] = {
         "phone": phone,
         "has_2fa": twofa,
-        "status": "active",
+        "status": status,
     }
     save_user_sessions()
-    auth_states.pop(uid, None)
-    started = await telethon_manager.start_client(uid)
-    logger.info(f"_finish: telethon started={started} for {uid}")
+
     if not started:
-        logger.warning(f"_finish: telethon start failed for {uid}")
+        logger.error(
+            "_finish: telethon start failed for %s — session saved as 'pending' "
+            "(файл сохранён от cleanup, но команды не заработают до /logout+переподключения)",
+            uid,
+        )
+        return False
+
+    # Premium-кэш мог быть заполнен «False» до подключения — сбрасываем,
+    # иначе юзер до 5 минут видит только unicode-эмодзи.
+    invalidate_premium_cache(uid)
+    logger.info(f"_finish: telethon started for {uid}")
+    return True

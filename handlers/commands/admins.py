@@ -1,23 +1,20 @@
 """Команда .admins / .админы — список администраторов чата. Telethon-only."""
 
+import asyncio
+
 from telethon.tl.functions.channels import GetParticipantsRequest
 from telethon.tl.types import (
     ChannelParticipantsAdmins,
-    ChannelParticipantAdmin,
     ChannelParticipantCreator,
 )
 
+from config import TELETHON_RESOLVE_TIMEOUT
+from utils.cmds import ADMINS_CMDS
 from utils.texts import Texts, render_for_user
 from handlers.commands._base import command_card
 
-ADMINS_CMDS = (".admins", ".админы")
 
 
-def _check(t: str | None) -> bool:
-    if not t:
-        return False
-    head = t.strip().lower().split()[0]
-    return head in ADMINS_CMDS
 
 
 async def handle(user_id: str, event) -> None:
@@ -27,13 +24,16 @@ async def handle(user_id: str, event) -> None:
         await event.edit(command_card("Admins", Texts.Admins.ONLY_GROUPS.render(premium=False)), parse_mode="html")
         return
     try:
-        result = await event.client(GetParticipantsRequest(
-            channel=event.chat_id,
-            filter=ChannelParticipantsAdmins(),
-            offset=0,
-            limit=200,
-            hash=0,
-        ))
+        result = await asyncio.wait_for(
+            event.client(GetParticipantsRequest(
+                channel=event.chat_id,
+                filter=ChannelParticipantsAdmins(),
+                offset=0,
+                limit=200,
+                hash=0,
+            )),
+            timeout=TELETHON_RESOLVE_TIMEOUT,
+        )
         if not result.participants:
             await event.edit(command_card("Admins", Texts.Admins.EMPTY.render(premium=False)), parse_mode="html")
             return
@@ -43,7 +43,15 @@ async def handle(user_id: str, event) -> None:
             user_id_p = getattr(p, "user_id", None)
             if not user_id_p:
                 continue
-            ent = await event.client.get_entity(user_id_p)
+            # До 200 последовательных RPC — каждый под таймаутом, иначе один
+            # зависший участник вешает всю команду.
+            try:
+                ent = await asyncio.wait_for(
+                    event.client.get_entity(user_id_p),
+                    timeout=TELETHON_RESOLVE_TIMEOUT,
+                )
+            except Exception:
+                continue
             if isinstance(p, ChannelParticipantCreator):
                 owner = ent
             else:
@@ -73,3 +81,15 @@ async def handle(user_id: str, event) -> None:
             )),
             parse_mode="html",
         )
+
+
+def matches(text: str | None) -> bool:
+    """Относится ли текст к `.admins` (алиасы — из utils.cmds).
+
+    Раньше здесь был `_check()`, который ни разу не вызывался: реальный
+    диспатч шёл через хардкод-кортеж в `telethon_manager`. Теперь функция
+    используемая и покрыта тестом на согласованность с реестром.
+    """
+    if not text:
+        return False
+    return text.strip().lower().split()[0] in ADMINS_CMDS

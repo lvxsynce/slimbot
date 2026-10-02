@@ -1,5 +1,18 @@
-"""Persistent, thread-aware conversation memory for `.ии`."""
+"""Persistent, thread-aware conversation memory for `.ии`.
 
+Все мутаторы СИНХРОННЫ и вызываются прямо из корутин (ai.py). Поэтому
+сохранение обязано быть дешёвым. Раньше ``_save()`` сериализовал весь файл
+(до 41.6 МБ на конфигурации по умолчанию) и делал ``fsync`` — 1.57 с
+блокировки event loop на КАЖДЫЙ ``.ии`` от ЛЮБОГО пользователя.
+
+Теперь запись идёт в фоне: мутатор только ставит «грязный» флаг, а
+coalescing-воркер дописывает файл одним проходом. Публичные мутаторы
+возвращают ``True``, если запись была отложена, — вызывающий код может
+``await ai_memory.flush()`` в точке, где важна гарантия долговечности
+(перед `await` сетевого вызова LLM, например).
+"""
+
+import asyncio
 import json
 import logging
 import os
@@ -13,33 +26,175 @@ from config import AI_MEMORY_FILE, AI_MEMORY_MAX_CHARS, AI_MEMORY_MAX_TOPICS, AI
 _history: dict[tuple[str, int, int], list[dict]] = {}
 _metadata: dict[tuple[str, int, int], dict] = {}
 _lock = threading.RLock()
+#: Сериализует запись файла. Фоновая задача и `flush()` могут стартовать
+#: одновременно; без него они делили один `.tmp`.
+_write_lock = threading.Lock()
 logger = logging.getLogger(__name__)
+
+# Coalescing: пока файл не записан, новые изменения только взводят флаг.
+_dirty = False
+_flush_task: asyncio.Task | None = None
+#: Сколько раз flush() готов повторить запись, пока флаг не снимется.
+#: 3 с запасом: мутация во время записи, упавшая запись, ещё одна мутация.
+_FLUSH_ATTEMPTS = 3
 
 
 def _key(user_id: str, chat_id: int, thread_id: int | None = 0) -> tuple[str, int, int]:
     return str(user_id), int(chat_id), int(thread_id or 0)
 
 
-def _save() -> None:
-    path = Path(AI_MEMORY_FILE)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {
-        "version": 2,
-        "conversations": {
-            f"{uid}:{cid}:{tid}": {
-                "turns": messages,
-                "summary": _metadata.get((uid, cid, tid), {}).get("summary", ""),
-                "updated_at": _metadata.get((uid, cid, tid), {}).get("updated_at", time.time()),
+def _write_now() -> None:
+    """Синхронный проход записи. Вызывается только из потока (см. flush).
+
+    Два инварианта, за которые стоило заплатить:
+
+    * ``_dirty`` сбрасывается ПОСЛЕ успешной записи, а не до: иначе
+      транзиентная ошибка (ENOSPC/EIOFBIG) навсегда теряла бы дельту.
+    * запись сериализована ``_write_lock``: фоновая задача и ``flush()`` могут
+      стартовать одновременно и без лока делили один ``.tmp`` — второй
+      ``os.replace`` падал с FileNotFoundError, а данные оставались
+      полузаписанными.
+    """
+    global _dirty
+    with _write_lock:
+        with _lock:
+            if not _dirty:
+                return
+            # Снимок под замком; сам I/O — уже без замка.
+            payload = {
+                "version": 2,
+                "conversations": {
+                    f"{uid}:{cid}:{tid}": {
+                        "turns": messages,
+                        "summary": _metadata.get((uid, cid, tid), {}).get("summary", ""),
+                        "updated_at": _metadata.get((uid, cid, tid), {}).get("updated_at", time.time()),
+                    }
+                    for (uid, cid, tid), messages in _history.items()
+                },
             }
-            for (uid, cid, tid), messages in _history.items()
-        },
-    }
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    with tmp.open("w", encoding="utf-8") as handle:
-        json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
-        handle.flush()
-        os.fsync(handle.fileno())
-    os.replace(tmp, path)
+
+        path = Path(AI_MEMORY_FILE)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with tmp.open("w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, separators=(",", ":"))
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        except OSError:
+            # Не оставляем мусорный .tmp, но сохраняем _dirty для ретрая.
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            raise
+
+        # Только теперь состояние на диске совпадает со снимком. Если мутация
+        # успела произойти ПОСЛЕ снятия снапшота, её флаг снова взведён — и
+        # следующий flush() её запишет.
+        with _lock:
+            _dirty = False
+
+
+def _mark_dirty() -> None:
+    global _dirty
+    with _lock:
+        _dirty = True
+
+
+def _take_flush_task() -> "asyncio.Task | None":
+    """Забрать текущую задачу записи и сбросить слот (в т.ч. после ошибки)."""
+    global _flush_task
+    task = _flush_task
+    _flush_task = None
+    return task
+
+
+async def flush() -> None:
+    """Дождаться, что память на диске.
+
+    Публичные мутаторы (`add_exchange`, `clear`, `clear_all`) НЕ пишут файл
+    сами — они только взводят флаг и планируют фоновую задачу. Вызывай
+    ``await flush()`` там, где потеря памяти при падении недопустима.
+
+    Гарантия: на выходе из flush() на диске лежит ВСЁ, что было добавлено до
+    её вызова. Цикл повторяет, пока флаг остаётся взведённым — мутация,
+    случившаяся во время записи, требует ещё одного прохода.
+    """
+    # ВАЖНО: цикл и все await — ВНЕ `_lock`. RLock повторяем только в одном
+    # потоке; удерживать его на время await из loop-треда и тут же брать его
+    # в worker-треде — гарантированный дедлок.
+    for _ in range(_FLUSH_ATTEMPTS):
+        task = _take_flush_task()
+        if task is not None and task is not asyncio.current_task():
+            try:
+                await task
+            except Exception:
+                logger.exception("ai_memory: background flush failed")
+
+        with _lock:
+            still_dirty = _dirty
+        if not still_dirty:
+            return
+        # Что-то изменилось во время записи (или предыдущая упала) — пишем
+        # синхронно в потоке, без планирования фоновой задачи.
+        await asyncio.to_thread(_write_now)
+
+    with _lock:
+        if _dirty:
+            logger.error("ai_memory: flush did not converge after %d attempts", _FLUSH_ATTEMPTS)
+
+
+async def _write_now_async() -> None:
+    await asyncio.to_thread(_write_now)
+
+
+def _schedule_save() -> bool:
+    """Взвести флаг и запланировать фоновую запись. True = запись отложена."""
+    _mark_dirty()
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Вне event loop (тесты, синхронные вызовы) — пишем сразу.
+        try:
+            _write_now()
+        except OSError:
+            logger.exception("Failed to persist AI memory")
+        return False
+    global _flush_task
+    # Ключевой момент: если предыдущая запись ЕЩЁ ИДЁТ, новую не планируем —
+    # иначе её снапшот устареет и дельта осиротеет. Но тогда запись должна
+    # взвести флаг ПОВТОРНО, когда завершится. Поэтому вешаем добровольца,
+    # который перезапустит запись, если после его завершения файл всё ещё
+    # «грязный».
+    if _flush_task is None or _flush_task.done():
+        _flush_task = loop.create_task(_write_then_retry())
+    return True
+
+
+async def _write_then_retry() -> None:
+    """Фоновая запись + добровольный повтор, если флаг снова взведён."""
+    global _flush_task
+    try:
+        await _write_now_async()
+    except OSError:
+        logger.exception("Failed to persist AI memory")
+    finally:
+        # Слот освобождаем ДО проверки: иначе flush() не сможет забрать задачу
+        # и увидит «_flush_task не None» вечно.
+        if _flush_task is asyncio.current_task():
+            _flush_task = None
+    with _lock:
+        dirty = _dirty
+    if dirty:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        if _flush_task is None or _flush_task.done():
+            _flush_task = loop.create_task(_write_then_retry())
 
 
 def _trim(messages: list[dict]) -> list[dict]:
@@ -110,7 +265,7 @@ def get(user_id: str, chat_id: int, thread_id: int | None = 0) -> list[dict]:
 
 
 def add(user_id: str, chat_id: int, role: str, content: str, thread_id: int | None = 0) -> None:
-    """Append one turn, trim complete history, and persist it atomically."""
+    """Append one turn and trim complete history (write is scheduled)."""
     if role not in {"user", "assistant"} or not content:
         return
     key = _key(user_id, chat_id, thread_id)
@@ -120,10 +275,7 @@ def add(user_id: str, chat_id: int, role: str, content: str, thread_id: int | No
         _history[key] = _trim(turns)
         _metadata.setdefault(key, {})["updated_at"] = time.time()
         _trim_topics()
-        try:
-            _save()
-        except OSError:
-            logger.exception("Failed to persist AI memory")
+    _schedule_save()
 
 
 def add_exchange(
@@ -133,7 +285,7 @@ def add_exchange(
     assistant_content: str,
     thread_id: int | None = 0,
 ) -> None:
-    """Store one complete exchange in a single atomic file update."""
+    """Store one complete exchange (write is scheduled, see `flush`)."""
     if not user_content or not assistant_content:
         return
     key = _key(user_id, chat_id, thread_id)
@@ -153,10 +305,7 @@ def add_exchange(
         )
         _metadata.setdefault(key, {})["updated_at"] = time.time()
         _trim_topics()
-        try:
-            _save()
-        except OSError:
-            logger.exception("Failed to persist AI memory")
+    _schedule_save()
 
 
 def clear(user_id: str, chat_id: int, thread_id: int | None = 0) -> int:
@@ -165,12 +314,9 @@ def clear(user_id: str, chat_id: int, thread_id: int | None = 0) -> int:
     with _lock:
         count = len(_history.pop(key, []))
         _metadata.pop(key, None)
-        if count:
-            try:
-                _save()
-            except OSError:
-                logger.exception("Failed to persist AI memory")
-        return count
+    if count:
+        _schedule_save()
+    return count
 
 
 def clear_all(user_id: str) -> int:
@@ -181,12 +327,9 @@ def clear_all(user_id: str) -> int:
         for key in keys:
             _history.pop(key, None)
             _metadata.pop(key, None)
-        if keys:
-            try:
-                _save()
-            except OSError:
-                logger.exception("Failed to persist AI memory")
-        return len(keys)
+    if keys:
+        _schedule_save()
+    return len(keys)
 
 
 def size(user_id: str, chat_id: int, thread_id: int | None = 0) -> int:
@@ -210,10 +353,7 @@ def set_summary(user_id: str, chat_id: int, summary: str, thread_id: int | None 
     with _lock:
         _metadata.setdefault(key, {})["summary"] = str(summary)[:AI_MEMORY_MAX_CHARS]
         _metadata[key]["updated_at"] = time.time()
-        try:
-            _save()
-        except OSError:
-            logger.exception("Failed to persist AI memory summary")
+    _schedule_save()
 
 
 def summary(user_id: str, chat_id: int, thread_id: int | None = 0) -> str:

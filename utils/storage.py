@@ -15,6 +15,8 @@ from config import (
     TEMPLATES_FILE,
     TEMPLATES_DIR,
     SESSIONS_DIR,
+    MODULES_FILE,
+    MODULES_DIR,
 )
 
 # user_id -> list of [chat_id, thread_id] (thread_id = 0/None для «весь чат»)
@@ -53,12 +55,18 @@ def _norm_thread(thread_id) -> int:
         return 0
 
 
-def thread_key(chat_id: int, thread_id) -> str:
-    return f"{chat_id}:{_norm_thread(thread_id)}"
+def was_processed(chat_id: int, msg_id: int, thread_id=None, user_id=None) -> bool:
+    """Защита от повторной обработки одного и того же события.
 
+    ``user_id`` ОБЯЗАТЕЛЕН для Telethon-путей: без него два разных юзера,
+    подключивших один чат через ``.watch``, делили ключ
+    ``(chat_id, msg_id, thread_id)``, и второй молча терял одноразовое фото
+    (view-once) — без лога и без ошибки. Ключ должен включать владельца.
 
-def was_processed(chat_id: int, msg_id: int, thread_id=None) -> bool:
-    key = (int(chat_id), int(msg_id), _norm_thread(thread_id))
+    Для одиночных aiogram-путей (``.love`` в личке с ботом) передавать uid
+    тоже правильно — он там доступен через ``message.from_user.id``.
+    """
+    key = (int(chat_id), int(msg_id), _norm_thread(thread_id), str(user_id) if user_id is not None else "")
     if key in _processed_msgs:
         return True
     now = time.time()
@@ -132,9 +140,12 @@ def _migrate_watched(old_value):
 
 def load_watched():
     global watched_chats
+    watched_chats = {}
     if WATCHED_CHATS_FILE.exists() or WATCHED_CHATS_FILE.with_suffix(WATCHED_CHATS_FILE.suffix + ".bak").exists():
         try:
             raw = _read_json(WATCHED_CHATS_FILE, {})
+            if not isinstance(raw, dict):
+                return
             # миграция старого формата
             watched_chats = {
                 str(uid): _migrate_watched(v) if isinstance(v, list) else []
@@ -145,8 +156,6 @@ def load_watched():
                 save_watched()
         except Exception:
             watched_chats = {}
-    else:
-        watched_chats = {}
 
 
 def save_watched():
@@ -171,8 +180,33 @@ def save_user_sessions():
 
 
 def load_photo_settings():
+    """Загрузить настройки фото.
+
+    Строгая проверка типа: раньше сюда попадал любой JSON. Если в файле
+    оказался, например, список, то ``photo_settings.get(...)`` в
+    ``is_photo_allowed`` кидал AttributeError прямо в обработчике входящих
+    — и view-once молча переставал сохраняться у этого юзера НАВСЕГДА.
+    """
     global photo_settings
-    photo_settings = _read_json(PHOTO_SETTINGS_FILE, {})
+    raw = _read_json(PHOTO_SETTINGS_FILE, {})
+    parsed: dict[str, dict] = {}
+    if isinstance(raw, dict):
+        for uid, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+            # нормализуем структуру: без этих полей watch.py падал бы с KeyError
+            exceptions = value.get("exceptions")
+            if not isinstance(exceptions, list):
+                exceptions = []
+            mode = value.get("mode")
+            if mode not in ("all", "all_except", "only_selected"):
+                mode = "all"
+            parsed[str(uid)] = {
+                "enabled": bool(value.get("enabled", False)),
+                "mode": mode,
+                "exceptions": exceptions,
+            }
+    photo_settings = parsed
 
 
 def save_photo_settings():
@@ -220,10 +254,12 @@ def save_auto_tr_chats():
 def load_user_tz():
     """user_id → str ('+3' или 'Europe/Moscow'). Минимальный валидатор: только строки."""
     global user_timezones
+    user_timezones = {}
     if USER_TZ_FILE.exists() or USER_TZ_FILE.with_suffix(USER_TZ_FILE.suffix + ".bak").exists():
         try:
             raw = _read_json(USER_TZ_FILE, {})
-            user_timezones = {str(uid): str(v) for uid, v in raw.items() if isinstance(v, str)}
+            if isinstance(raw, dict):
+                user_timezones = {str(uid): str(v) for uid, v in raw.items() if isinstance(v, str)}
         except Exception:
             user_timezones = {}
 
@@ -373,6 +409,89 @@ def load_nya_chats():
 def save_nya_chats():
     NYA_CHATS_FILE.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(NYA_CHATS_FILE, nya_chats)
+
+
+# ----------------- модули (пользовательский код) -----------------
+#
+# Ключ — str(user_id), значение — {имя модуля: {meta}}. Исходники лежат
+# отдельно (modules/<hash>/<name>.py), здесь только метаданные, поэтому
+# битый/чужой .py не ломает импорт бота.
+module_settings: dict[str, dict] = {}
+
+
+def module_dir(user_id: str) -> Path:
+    """Каталог модулей юзера. Хэш — тот же, что у сессий и шаблонов."""
+    h = hashlib.sha256(str(user_id).encode()).hexdigest()[:16]
+    return MODULES_DIR / h
+
+
+def load_modules():
+    global module_settings
+    try:
+        raw = _read_json(MODULES_FILE, {})
+    except Exception:
+        raw = {}
+    if not isinstance(raw, dict):
+        module_settings = {}
+        return
+    parsed: dict[str, dict] = {}
+    for uid, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        entries: dict[str, dict] = {}
+        for name, meta in value.items():
+            if not isinstance(name, str) or not isinstance(meta, dict):
+                continue
+            entries[name] = {
+                "enabled": bool(meta.get("enabled", True)),
+                "installed_at": meta.get("installed_at"),
+            }
+        if entries:
+            parsed[str(uid)] = entries
+    module_settings = parsed
+
+
+def save_modules():
+    _atomic_write(MODULES_FILE, module_settings)
+
+
+def get_modules(user_id: str) -> dict:
+    """Метаданные модулей юзера: {имя: {enabled, installed_at}}."""
+    return dict(module_settings.get(str(user_id), {}))
+
+
+def is_module_enabled(user_id: str, name: str) -> bool:
+    return bool(module_settings.get(str(user_id), {}).get(name, {}).get("enabled"))
+
+
+def set_module_enabled(user_id: str, name: str, enabled: bool) -> bool:
+    uid, key = str(user_id), str(name)
+    entry = module_settings.setdefault(uid, {}).setdefault(key, {"installed_at": None})
+    entry["enabled"] = bool(enabled)
+    save_modules()
+    return bool(enabled)
+
+
+def register_module(user_id: str, name: str, *, enabled: bool = True) -> None:
+    """Модуль только что установлен — записываем метаданные.
+
+    Переустановка (тот же `name`) НЕ сбрасывает флаг `enabled`: иначе
+    перезалив модуля молча включал бы его после ручного выключения.
+    """
+    uid, key = str(user_id), str(name)
+    entries = module_settings.setdefault(uid, {})
+    was_enabled = bool(entries[key]["enabled"]) if key in entries else bool(enabled)
+    entries[key] = {"enabled": was_enabled, "installed_at": time.time()}
+    save_modules()
+
+
+def unregister_module(user_id: str, name: str) -> None:
+    entries = module_settings.get(str(user_id))
+    if entries and str(name) in entries:
+        entries.pop(str(name), None)
+        if not entries:
+            module_settings.pop(str(user_id), None)
+        save_modules()
 
 
 def is_nya_chat(user_id: str, chat_id: int) -> bool:
@@ -661,3 +780,4 @@ load_user_tz()
 load_nya_chats()
 load_knowledge_settings()
 load_templates()
+load_modules()

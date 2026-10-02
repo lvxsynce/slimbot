@@ -6,12 +6,27 @@ import time
 
 from aiogram.types import FSInputFile
 from telethon import TelegramClient, events
-from telethon.errors import (
-    SessionPasswordNeededError,
-    PhoneCodeInvalidError,
-    PhoneCodeExpiredError,
-    FloodWaitError,
-)
+from telethon.errors import FloodWaitError
+from utils.timezones import is_reset_value
+
+
+def _ping_pairs(fields: dict):
+    """Пары (подпись, значение) для карточки `.ping` — общий формат."""
+    labels = (
+        ("Chat ID", "chat_id"), ("User ID", "user_id"), ("DC", "dc_id"),
+        ("Connected", "connected"), ("Authorized", "authorized"),
+        ("Telegram API RTT", "api_rtt_ms"), ("get_me RTT", "get_me_rtt_ms"),
+        ("Edit RTT", "edit_rtt_ms"),
+    )
+    out = []
+    for label, key in labels:
+        value = fields.get(key)
+        if value is None:
+            continue
+        if key in ("connected", "authorized"):
+            value = "yes" if value else "no"
+        out.append((label, value))
+    return out
 from telethon.tl.types import MessageMediaDocument
 from telethon.tl.functions.users import GetFullUserRequest
 from telethon.tl.types import User as TUser
@@ -33,10 +48,9 @@ from config import (
     TELETHON_RECONNECT_MAX_DELAY,
     TELETHON_HEALTH_INTERVAL,
     TELETHON_HEALTH_TIMEOUT,
-    EXPENSIVE_COMMAND_LIMIT,
-    EXPENSIVE_COMMAND_WINDOW,
-    AI_REQUEST_LIMIT,
-    AI_REQUEST_WINDOW,
+    MAX_ACTIVE_SESSIONS,
+    SESSION_START_BATCH,
+    SESSION_START_DELAY,
 )
 from utils.storage import (
     user_sessions,
@@ -50,23 +64,61 @@ from utils.storage import (
     get_auto_tr_language,
     toggle_auto_tr_chat,
     is_nya_chat,
-    get_nya_chats,
-    toggle_nya_chat,
     get_knowledge_selected_chats,
 )
 from utils.texts import Texts, render_for_user
-from utils.premium import is_entity_premium, invalidate_premium_cache
+from utils.tlm_common import (
+    render_usernames as _render_usernames,
+    thread_id_of,
+    telethon_reply_to,
+    usernames_of as _usernames_of,
+)
+from utils import rate_limit_gate as gate
+from utils.escape import esc as _esc
+from utils.premium import invalidate_premium_cache
 
 logger = logging.getLogger(__name__)
 
-# Голова dot-команды для `.шаб` / `.+шаб` / `.-шаб` (шаблоны сообщений).
-# Литерал продублирован намеренно: handlers.commands тянет за собой весь пакет
-# команд, а этот модуль импортируется ими. Дрейф ловит тест
-# tests/test_templates.py::test_dispatch_cmds_match_template_module.
-_TEMPLATE_CMDS = (
-    ".шаб", ".шаблон", ".template", ".tmpl", ".tpl",
-    ".+шаб", ".+шаблон", ".+template", ".+tmpl", ".+tpl",
-    ".-шаб", ".-шаблон", ".-template", ".-tmpl", ".-tpl",
+# Алиасы команд берём из единого реестра utils.cmds (листовой модуль без
+# импортов проекта — его можно тянуть отсюда без циклической зависимости).
+# Раньше в этом файле был свой хардкод-кортеж для `.шаб` плюс девять других
+# списков в самих модулях команд; дрейф ловили лишь два теста, и `.пер`
+# реально разошёлся с `_helpdb`. Теперь источник ровно один.
+from utils.cmds import (  # noqa: E402
+    DEL_CMDS,
+    DM_CMDS,
+    TAGALL_CMDS,
+    ADMINS_CMDS,
+    INVITE_CMDS,
+    PIN_CMDS,
+    UNPIN_CMDS,
+    VGF_CMDS,
+    NYA_CMDS,
+    QUOTE_CMDS,
+    GOVNO_CMDS,
+    TEMPLATE_CMDS,
+    PING_CMDS,
+    TIME_CMDS,
+    ID_CMDS,
+    ME_CMDS,
+    CHAT_CMDS,
+    WHO_CMDS,
+    LOVE_CMDS,
+    HELP_CMDS,
+    COIN_CMDS,
+    WATCH_CMDS,
+    UNWATCH_CMDS,
+    WATCHED_CMDS,
+    NET_CMDS,
+    TR_CMDS,
+    CALC_CMDS,
+    SAVE_CMDS,
+    HASH_CMDS,
+    UUID_CMDS,
+    B64_CMDS,
+    TIMEZONE_CMDS,
+    AI_CMDS,
+    OPENCODE_CMDS,
 )
 
 
@@ -74,50 +126,6 @@ def _command_card(title: str, text: str) -> str:
     """Apply the shared command layout without creating an import cycle."""
     from handlers.commands._base import command_card
     return command_card(title, text)
-
-
-def thread_id_of(event) -> int:
-    """Извлекает message_thread_id (id топика форума) из Telethon-события.
-    Возвращает 0 если не форум / нет reply_to."""
-    msg = getattr(event, "message", None)
-    if msg is None:
-        return 0
-    reply_to = getattr(msg, "reply_to", None)
-    if reply_to is None:
-        return 0
-    # forum_topic: TopicaMessage — собственно сам топик (topic_id)
-    forum = getattr(reply_to, "forum_topic", False)
-    if forum:
-        top = getattr(reply_to, "reply_to_top_id", None)
-        if top:
-            return int(top)
-        rmi = getattr(reply_to, "reply_to_msg_id", None)
-        return int(rmi) if rmi else 0
-    # forum-чаты: возвращаем top_id, если есть и он != reply_to_msg_id
-    top = getattr(reply_to, "reply_to_top_id", None)
-    if top:
-        return int(top)
-    return 0
-
-
-def telethon_reply_to(event):
-    """Возвращает id сообщения для reply_to в event.respond/send_message,
-    чтобы остаться в том же топике форума.
-    В форумах берём reply_to_msg_id из reply_to (id сообщения-корня топика
-    или сообщение, на которое ответили — оба держат ответ в топике)."""
-    msg = getattr(event, "message", None)
-    if msg is None:
-        return None
-    reply_to = getattr(msg, "reply_to", None)
-    if reply_to is None:
-        return None
-    # Если отвечали внутри топика —优先 top_msg_id (корень топика),
-    # иначе reply_to_msg_id (само сообщение в топике).
-    top = getattr(reply_to, "reply_to_top_id", None)
-    if top:
-        return int(top)
-    rmi = getattr(reply_to, "reply_to_msg_id", None)
-    return int(rmi) if rmi else None
 
 
 async def _topic_name_async(client, chat_id: int, thread_id: int) -> str:
@@ -219,6 +227,8 @@ class TelethonManager:
         # Per-(user, chat) lock для сериализации auto-tr replies (защита от flood control).
         self._tr_locks: dict[tuple[str, int], asyncio.Lock] = {}
         self._auto_tr_messages: set[tuple[str, int, int]] = set()
+        # Когда ключ был добавлен — для свипа зависших (см. sweep_auto_tr_messages).
+        self._auto_tr_seen: dict[tuple[str, int, int], float] = {}
         # Per-(user, chat) lock для сериализации .ня edit'ов (та же защита:
         # если юзер бёрстит 5+ сообщениями подряд — N concurrent event.edit
         # → FloodWait. С lock'ом edit'ы идут последовательно).
@@ -343,6 +353,25 @@ class TelethonManager:
     def get_client(self, user_id: str) -> TelegramClient | None:
         return self._clients.get(user_id)
 
+    def sweep_auto_tr_messages(self, max_age: float = 300.0) -> int:
+        """Вычистить зависшие ключи `_auto_tr_messages`.
+
+        Ключ снимается в `finally` задачи, но задача может быть отменена
+        ДО первого шага (create_task + немедленный cancel на shutdown) — тогда
+        `finally` не отработает и ключ утечёт навсегда. Свип по возрасту
+        закрывает эту дыру.
+
+        Возвращает число удалённых ключей.
+        """
+        now = time.monotonic()
+        stale = [k for k, seen in self._auto_tr_seen.items() if now - seen > max_age]
+        for key in stale:
+            self._auto_tr_seen.pop(key, None)
+            self._auto_tr_messages.discard(key)
+        if stale:
+            logger.info("sweep_auto_tr_messages: dropped %d stale keys", len(stale))
+        return len(stale)
+
     async def stop_client(self, user_id: str):
         user_id = str(user_id)
         self._stopping.add(user_id)
@@ -365,6 +394,9 @@ class TelethonManager:
             self._nya_locks.pop(key, None)
         for key in [key for key in self._auto_tr_messages if key[0] == user_id]:
             self._auto_tr_messages.discard(key)
+            self._auto_tr_seen.pop(key, None)
+        # Старт-локи тоже росли без границ (создаются в start_client).
+        self._start_locks.pop(user_id, None)
         self._stopping.discard(user_id)
 
     async def stop_all(self):
@@ -402,6 +434,7 @@ class TelethonManager:
     async def check_clients_health(self) -> dict[str, bool]:
         """Check each client and kick the existing reconnect loop if needed."""
         results: dict[str, bool] = {}
+        self.sweep_auto_tr_messages()
         for uid, client in list(self._clients.items()):
             if uid in self._stopping:
                 continue
@@ -461,6 +494,8 @@ class TelethonManager:
                 if await tmp.is_user_authorized():
                     await tmp.log_out()
                     revoked = True
+                else:
+                    logger.info(f"logout: uid={user_id} session not authorized, nothing to revoke")
             except Exception as e:
                 logger.warning(f"logout: standalone log_out failed for {user_id}: {e}")
             finally:
@@ -491,13 +526,30 @@ class TelethonManager:
             self._nya_locks.pop(k, None)
         for k in [k for k in self._auto_tr_messages if k[0] == user_id]:
             self._auto_tr_messages.discard(k)
+            self._auto_tr_seen.pop(k, None)
+        # clear_owner бьёт по общей базе (DELETE по 200k+ строк). Уводим в
+        # поток: раньше это было ~10 с блокировки event loop на КАЖДЫЙ logout,
+        # и все остальные пользователи стояли колом.
         from utils.knowledge_db import clear_owner
-        clear_owner(user_id)
+        await asyncio.to_thread(clear_owner, user_id)
 
         logger.info(f"logout: done for {user_id} revoked={revoked}")
-        return True
+        # Раньше здесь был безусловный `return True`, из-за чего UI всегда
+        # показывал «сессия отозвана в Telegram» даже когда log_out() упал,
+        # а Texts.Logout.NOTE_LOCAL был недостижим.
+        return revoked
 
     async def start_all_active(self):
+        """Поднять все сохранённые активные сессии.
+
+        Раньше все клиенты поднимались ОДНИМ `asyncio.gather` без ограничений:
+        200 сохранённых сессий = 200 одновременных connect() + is_user_authorized()
+        на старте, что почти гарантированно ловит flood-control по IP/API_ID
+        (все аккаунты делят одни и те же креды). Теперь:
+
+        * `MAX_ACTIVE_SESSIONS` жёстко ограничивает количество (0 = без лимита);
+        * подъём идёт волнами по `SESSION_START_BATCH`, а не разом.
+        """
         active_uids = [
             str(uid) for uid, data in user_sessions.items()
             if isinstance(data, dict) and data.get("status") == "active"
@@ -506,17 +558,30 @@ class TelethonManager:
             logger.info("start_all_active: no active sessions to restore")
             return
 
-        # Restore clients independently. One broken/stale session must not
-        # prevent the remaining accounts from coming online.
-        results = await asyncio.gather(
-            *(self._restore_client(uid) for uid in active_uids),
-            return_exceptions=True,
-        )
-        for uid, result in zip(active_uids, results):
-            if isinstance(result, BaseException):
-                logger.error("start_all_active: uid=%s failed during restore: %s", uid, result)
-            else:
-                logger.info("start_all_active: uid=%s started=%s", uid, result)
+        if MAX_ACTIVE_SESSIONS and len(active_uids) > MAX_ACTIVE_SESSIONS:
+            logger.warning(
+                "start_all_active: %d stored sessions but MAX_ACTIVE_SESSIONS=%d — "
+                "поднимутся первые %d, остальные ждут ручного подключения",
+                len(active_uids), MAX_ACTIVE_SESSIONS, MAX_ACTIVE_SESSIONS,
+            )
+            active_uids = active_uids[:MAX_ACTIVE_SESSIONS]
+
+        for start in range(0, len(active_uids), SESSION_START_BATCH):
+            batch = active_uids[start:start + SESSION_START_BATCH]
+            if start:
+                # Пауза между волнами, чтобы Telegram не увидел залп хендшейков.
+                await asyncio.sleep(SESSION_START_DELAY)
+            # Restore clients independently. One broken/stale session must not
+            # prevent the remaining accounts in the batch from coming online.
+            results = await asyncio.gather(
+                *(self._restore_client(uid) for uid in batch),
+                return_exceptions=True,
+            )
+            for uid, result in zip(batch, results):
+                if isinstance(result, BaseException):
+                    logger.error("start_all_active: uid=%s failed during restore: %s", uid, result)
+                else:
+                    logger.info("start_all_active: uid=%s started=%s", uid, result)
 
     async def _restore_client(self, uid: str) -> bool:
         """Restore one persisted client and resume its durable work."""
@@ -638,8 +703,7 @@ class TelethonManager:
             except Exception:
                 full_user = None
 
-        sender_premium = is_entity_premium(sender)
-        text = _format_who_telethon(sender, full_user, premium_render=sender_premium)
+        text = _format_who_telethon(sender, full_user)
         photo = await self.download_avatar_bytes(user_id, sender)
         rto = event.reply_to_msg_id
 
@@ -723,9 +787,6 @@ class TelethonManager:
             )
             return
 
-        # sender premium — определяет emoji-render в заголовке карточки .who
-        sender_premium = is_entity_premium(await event.get_sender())
-
         targets = parse_dot_targets(args)
         if not targets:
             await event.edit(
@@ -769,7 +830,7 @@ class TelethonManager:
                 except Exception:
                     full_user = None
 
-            text = _format_who_telethon(entity, full_user, premium_render=sender_premium)
+            text = _format_who_telethon(entity, full_user)
             photo = await self.download_avatar_bytes(user_id, entity)
             rto = telethon_reply_to(event)
 
@@ -869,31 +930,22 @@ class TelethonManager:
         except Exception:
             edit_rtt = None
 
-        def ms(value):
-            return f"{value} ms" if value is not None else "—"
+        from utils.shared_cmd import ping_fields
 
         user_id_value = getattr(me, "id", user_id) if me else user_id
         dc_id = getattr(getattr(client, "session", None), "dc_id", None) if client else None
-        total_ms = int((time.monotonic() - started) * 1000)
-        # The final edit is not observable until after it is sent; include the
-        # measured edit RTT as the best estimate in the displayed total.
-        total_ms += edit_rtt or 0
-        card = (
-            "<b>Slim bot | Ping</b>\n"
-            "<blockquote>"
-            f"<b>Chat ID:</b> <code>{event.chat_id}</code>\n"
-            f"<b>User ID:</b> <code>{user_id_value}</code>\n"
-            f"<b>DC:</b> <code>{dc_id or '—'}</code>\n"
-            f"<b>Connected:</b> <code>{'yes' if connected else 'no'}</code>\n"
-            f"<b>Authorized:</b> <code>{'yes' if authorized else 'no'}</code>\n\n"
-            f"<b>Telegram API RTT:</b> <code>{ms(api_rtt)}</code>\n"
-            f"<b>get_me RTT:</b> <code>{ms(get_me_rtt)}</code>\n"
-            f"<b>Edit RTT:</b> <code>{ms(edit_rtt)}</code>\n"
-            f"<b>Total:</b> <code>{total_ms} ms</code>"
-            "</blockquote>"
+        fields = ping_fields(
+            api_rtt_ms=api_rtt, get_me_rtt_ms=get_me_rtt, edit_rtt_ms=edit_rtt,
+            chat_id=event.chat_id, user_id=user_id_value, dc_id=dc_id,
+            connected=connected, authorized=authorized,
         )
+        body = "\n".join(f"<b>{label}:</b> <code>{value}</code>"
+                          for label, value in _ping_pairs(fields))
         try:
-            await asyncio.wait_for(event.edit(card, parse_mode="html"), timeout=TELETHON_RESOLVE_TIMEOUT)
+            await asyncio.wait_for(
+                event.edit(_command_card("Ping", body), parse_mode="html"),
+                timeout=TELETHON_RESOLVE_TIMEOUT,
+            )
         except Exception as exc:
             logger.warning("Detailed ping final edit failed: %s", exc)
 
@@ -915,18 +967,32 @@ class TelethonManager:
         if not text.startswith("."):
             try:
                 if is_auto_tr_chat(str(user_id), event.chat_id):
+                    # Ключ держим, пока задача жива, и снимаем в её `finally`.
+                    # Раньше здесь стояло `if key in ...: discard; return` —
+                    # это снимало guard у ещё работающей задачи, и третье
+                    # событие спавнило вторую конкурентную задачу, чей
+                    # except-ветка мог откатить перевод первой.
                     key = (str(user_id), event.chat_id, event.id)
                     if key in self._auto_tr_messages:
-                        self._auto_tr_messages.discard(key)
                         return
                     self._auto_tr_messages.add(key)
-                    asyncio.create_task(self._apply_auto_tr_outgoing(user_id, event, text))
-                    return
+                    self._auto_tr_seen[key] = time.monotonic()
+                    asyncio.create_task(
+                        self._apply_auto_tr_outgoing(user_id, event, text),
+                        name=f"auto-tr-out-{user_id}-{event.chat_id}-{event.id}",
+                    )
+                # Ветка .ня была недостижимой: первая делала `return`.
+                # Обе фичи могут быть включены в одном чате, и обе должны
+                # срабатывать (перевод применяется к тексту до/после — не важно,
+                # главное не терять ни одну).
                 if is_nya_chat(str(user_id), event.chat_id):
-                    asyncio.create_task(self._apply_nya(user_id, event, text))
+                    asyncio.create_task(
+                        self._apply_nya(user_id, event, text),
+                        name=f"nya-{user_id}-{event.chat_id}-{event.id}",
+                    )
             except Exception:
                 # Если что-то сломалось в check'е — не помашем основной поток.
-                pass
+                logger.debug("_handle_outgoing: auto-tr/nya dispatch failed", exc_info=True)
             return
 
         if event.is_private:
@@ -937,7 +1003,7 @@ class TelethonManager:
         chat_id = event.chat_id
         msg_id = event.id
         tid = thread_id_of(event)
-        if was_processed(chat_id, msg_id, tid):
+        if was_processed(chat_id, msg_id, tid, user_id):
             return
 
         # reply_to для остаться в этом же топике при respond/send_message
@@ -953,25 +1019,29 @@ class TelethonManager:
             await event.edit(render_help(key), parse_mode="html")
             return
 
-        if head in (
-            ".net", ".сеть", ".сет",
-            ".ии", ".ai", ".ии?", ".calc", ".калк", ".hash", ".хеш", ".хэш",
-            ".вгф", ".vfg", ".gif",
-        ):
-            from utils.rate_limit import allow
-            if head in (".ии", ".ai", ".ии?"):
-                operation, limit, window = "ai", AI_REQUEST_LIMIT, AI_REQUEST_WINDOW
-            else:
-                operation, limit, window = "network", EXPENSIVE_COMMAND_LIMIT, EXPENSIVE_COMMAND_WINDOW
-            if not allow(user_id, operation, limit=limit, window=window):
-                await event.edit(_command_card("Command", "[x] Слишком много запросов. Подожди немного."), parse_mode="html")
-                return
+        # Пользовательские модули. Проверка идёт ДО системной цепочки, иначе
+        # перехватить системную команду (свой `.ping` вместо системного)
+        # было бы невозможно и весь конфликт-механизм бессмыслен.
+        #
+        # Порядок именно такой:
+        #   1. команда отключена юзером → тишина (и для системной, и для
+        #      модульной: если модуль её перехватил — см. п.2);
+        #   2. модуль заявил этот head → выполняем модуль;
+        #   3. иначе — обычная системная цепочка ниже.
+        if await self._handle_modules(user_id, event, head, tid):
+            return
 
-        if head in (".ping", ".пинг"):
+        # Единый гейт для обоих путей (utils.rate_limit_gate) — иначе
+        # набор ограниренных команд расходился между aiogram и Telethon.
+        if gate.is_limited(head) and not gate.check(head, user_id):
+            await event.edit(_command_card("Command", gate.RATE_LIMIT_TEXT), parse_mode="html")
+            return
+
+        if head in PING_CMDS:
             await self._handle_ping(user_id, event)
-        elif head in (".time", ".время"):
+        elif head in TIME_CMDS:
             await event.edit(await _base.render_time(user_id), parse_mode="html")
-        elif head in (".id", ".инфо"):
+        elif head in ID_CMDS:
             sender = await event.get_sender()
             await event.edit(
                 await _base.render_id(
@@ -984,13 +1054,13 @@ class TelethonManager:
                 ),
                 parse_mode="html",
             )
-        elif head in (".love", ".любовь"):
+        elif head in LOVE_CMDS:
             await self._handle_anim(user_id, event, kind="love")
-        elif head in (".govno", ".говно"):
+        elif head in GOVNO_CMDS:
             await self._handle_anim(user_id, event, kind="govno")
-        elif head in (".help", ".помощь"):
+        elif head in HELP_CMDS:
             await event.edit(await _base.render_help(user_id, True), parse_mode="html")
-        elif head in (".me", ".я"):
+        elif head in ME_CMDS:
             sender = await event.get_sender()
             full_self = None
             client_self = self.get_client(user_id)
@@ -1001,12 +1071,11 @@ class TelethonManager:
                     )
                 except Exception:
                     full_self = None
-            sender_premium = is_entity_premium(sender)
             await event.edit(
-                _format_me_telethon(sender, full_self, premium_render=sender_premium),
+                _format_me_telethon(sender, full_self),
                 parse_mode="html",
             )
-        elif head in (".chat", ".чат"):
+        elif head in CHAT_CMDS:
             chat = await event.get_chat()
             full_chat = None
             client_chat = self.get_client(user_id)
@@ -1018,12 +1087,11 @@ class TelethonManager:
                     )
                 except Exception:
                     full_chat = None
-            sender_premium = is_entity_premium(await event.get_sender())
             await event.edit(
-                _format_chat_telethon(chat, event.chat_id, full_chat, premium_render=sender_premium),
+                _format_chat_telethon(chat, event.chat_id, full_chat),
                 parse_mode="html",
             )
-        elif head in (".who", ".кто"):
+        elif head in WHO_CMDS:
             parts = event.raw_text.strip().split(maxsplit=1)
             args = parts[1].strip() if len(parts) > 1 else ""
             if args:
@@ -1037,74 +1105,72 @@ class TelethonManager:
                     )
                     return
                 await self._who_with_reply(user_id, event, msg.sender)
-        elif head in (".watch", ".следить", ".unwatch", ".хватит", ".забыть",
-                      ".watched", ".список"):
+        elif head in WATCH_CMDS or head in UNWATCH_CMDS or head in WATCHED_CMDS:
             from handlers.commands.watch import handle_telethon
             await handle_telethon(user_id, event, thread_id=tid)
-        elif head in (".net", ".сеть", ".сет"):
+        elif head in NET_CMDS:
             from handlers.commands.netcmds import _do_net
             parts = event.raw_text.strip().split(maxsplit=1)
             args = parts[1] if len(parts) > 1 else ""
             reply = await event.get_reply_message()
             reply_text = reply.raw_text if reply else None
             await event.edit(await _do_net(user_id, args, reply_text), parse_mode="html", link_preview=False)
-        elif head in (".del", ".удалить"):
+        elif head in DEL_CMDS:
             from handlers.commands.delmsg import handle as handle_del
             await handle_del(user_id, event)
-        elif head in (".tr", ".перевод", ".пер", ".перевести"):
+        elif head in TR_CMDS:
             await self._handle_tr(user_id, event)
-        elif head in (".calc", ".калк"):
+        elif head in CALC_CMDS:
             await self._handle_calc(event)
-        elif head in (".save", ".сохранить"):
+        elif head in SAVE_CMDS:
             await self._handle_save(event)
-        elif head in (".hash", ".хеш", ".хэш"):
+        elif head in HASH_CMDS:
             await self._handle_hash(event)
-        elif head in (".uuid", ".юид"):
+        elif head in UUID_CMDS:
             await self._handle_uuid(event)
-        elif head in (".b64", ".base64"):
+        elif head in B64_CMDS:
             await self._handle_b64(event)
-        elif head in (".timezone", ".таймзона", ".tz"):
+        elif head in TIMEZONE_CMDS:
             await self._handle_timezone(user_id, event)
-        elif head in (".tagall", ".тегвсех", ".все"):
+        elif head in TAGALL_CMDS:
             from handlers.commands.tagall import handle as handle_tagall
             await handle_tagall(user_id, event)
-        elif head in (".влс", ".vls", ".лс", ".dm"):
+        elif head in DM_CMDS:
             from handlers.commands.dm import handle as handle_dm
             await handle_dm(user_id, event)
-        elif head in (".admins", ".админы"):
+        elif head in ADMINS_CMDS:
             from handlers.commands.admins import handle as handle_admins
             await handle_admins(user_id, event)
-        elif head in (".pin", ".закрепить", ".закреп"):
+        elif head in PIN_CMDS:
             from handlers.commands.pin import handle as handle_pin
             await handle_pin(user_id, event)
-        elif head in (".unpin", ".открепить", ".раскрепить", ".откреп"):
+        elif head in UNPIN_CMDS:
             from handlers.commands.pin import handle as handle_pin
             await handle_pin(user_id, event)
-        elif head in (".ссылка", ".invitelink", ".инвайт", ".invite"):
+        elif head in INVITE_CMDS:
             from handlers.commands.invitelink import handle as handle_invite
             await handle_invite(user_id, event)
-        elif head in (".quote", ".цитата", ".q", ".цит"):
+        elif head in QUOTE_CMDS:
             from handlers.commands.quote import handle as handle_quote
             await handle_quote(user_id, event)
-        elif head in _TEMPLATE_CMDS:
+        elif head in TEMPLATE_CMDS:
             from handlers.commands.template import handle as handle_template
             await handle_template(user_id, event)
-        elif head in (".ня",):
+        elif head in NYA_CMDS:
             from handlers.commands.nya import handle as handle_nya
             await handle_nya(user_id, event)
-        elif head in (".вгф", ".vfg", ".gif"):
+        elif head in VGF_CMDS:
             from handlers.commands.vgf import handle as handle_vgf
             await handle_vgf(user_id, event)
-        elif head in (".монетка", ".coin", ".монета", ".орёл", ".решка"):
-            import random
-            from utils.texts import Texts, render_for_user
-            result = random.choice(["орёл", "решка"])
-            text_obj = Texts.Coin.HEAD if result == "орёл" else Texts.Coin.TAIL
-            await event.edit(await render_for_user(user_id, text_obj), parse_mode="html")
-        elif head in (".ии", ".ai", ".ии?"):
+        elif head in COIN_CMDS:
+            # Общий бросок с aiogram-путём (handlers.commands.coin.flip):
+            # раньше эти 4 строки были продублированы и разъезжались.
+            from handlers.commands.coin import flip
+            await event.edit(await render_for_user(user_id, flip()[1]), parse_mode="html")
+        elif head in AI_CMDS:
             from handlers.commands.ai import handle as handle_ai
             await handle_ai(user_id, event)
-        elif head in (".опенкод", ".opencode"):
+        elif head in OPENCODE_CMDS:
             from handlers.commands.opencode import handle as handle_opencode
             await handle_opencode(user_id, event)
         else:
@@ -1112,6 +1178,85 @@ class TelethonManager:
             hint = suggest_text(head)
             if hint:
                 await event.edit(_command_card("Command", hint), parse_mode="html")
+
+    # ------------------------------------------------------------------
+    # Пользовательские модули
+    # ------------------------------------------------------------------
+
+    async def _handle_modules(self, user_id: str, event, head: str, tid: int = 0) -> bool:
+        """Разобраться с dot-командой через модули.
+
+        True — обработано (выполнен модулем или намеренно проигнорировано),
+        идти дальше по системной цепочке не нужно.
+
+        Правила:
+          * выключенная юзером команда не выполняется вообще: ни системная,
+            ни модульная (модуль может перехватить head только явно, через
+            решение по конфликту — тогда он и считается «своим»);
+          * если head зарегистрирован модулем этого юзера — выполняем
+            модуль, системную команду не трогаем;
+          * иначе False, идёт системная цепочка.
+        """
+        from utils import modules as _modules
+        from utils.module_state import ModuleState
+
+        if not _modules.modules_enabled():
+            return False
+        if not _modules.module_allowed(user_id):
+            return False
+
+        spec = _modules.find_command(user_id, head)
+        if spec is None:
+            # Модуль этот head не заявил. Если юзер выключил системную
+            # команду — молчим: иначе он получил бы «пинг», который сам
+            # отключил, а следом подсказку «возможно, это .ping?».
+            if _modules.is_system_disabled(user_id, head):
+                logger.info("system command %s disabled by uid=%s", head, user_id)
+                return True
+            return False
+
+        if "telethon" not in getattr(spec.handler, "_module_paths", ("telethon", "bot")):
+            return False
+
+        # Модуль заявил СИСТЕМНУЮ команду, но юзер не подтвердил замену —
+        # отдаём обработку системной цепочке. Иначе модуль, объявивший
+        # `.ping`, молча перехватывал бы его сразу после установки.
+        # Совпадает с правилом в handlers/commands/modules.py.
+        if head in _modules.system_heads() and not _modules.is_system_disabled(user_id, head):
+            return False
+
+        # Гейт лимитов — тот же, что у встроенных команд. Бюджет
+        # модульной команды прописан в `rate_limit_gate.BUDGETS` при
+        # загрузке модуля (параметр `rate=` в `@command`).
+        if gate.is_limited(head) and not gate.check(head, user_id):
+            await event.edit(gate.RATE_LIMIT_TEXT, parse_mode="html")
+            return True
+
+        module = _modules.module_of_spec(user_id, spec)
+        parts = (event.raw_text or "").strip().split(maxsplit=1)
+        args = parts[1].strip() if len(parts) > 1 else ""
+        ctx = _modules.Context(
+            user_id=str(user_id),
+            args=args,
+            argv=args.split(),
+            head=spec.head,
+            event=event,
+            client=getattr(event, "client", None),
+            module=module,
+            meta={
+                "name": module.name if module else "",
+                "title": module.title if module else "",
+                "version": module.version if module else "",
+                "author": module.author if module else "",
+                "description": module.description if module else "",
+            },
+            state=ModuleState(user_id, module.name if module else spec.head),
+            thread_id=tid or 0,
+        )
+        result = await _modules.run_command(user_id, spec, ctx)
+        if isinstance(result, str) and result.strip():
+            await event.edit(result, parse_mode="html")
+        return True
 
     async def _apply_auto_tr_outgoing(self, user_id: str, event, text: str) -> None:
         """Переводит собственное сообщение в выбранный для чата язык."""
@@ -1159,7 +1304,9 @@ class TelethonManager:
                 except Exception:
                     pass
             finally:
-                self._auto_tr_messages.discard((str(user_id), event.chat_id, event.id))
+                key = (str(user_id), event.chat_id, event.id)
+                self._auto_tr_messages.discard(key)
+                self._auto_tr_seen.pop(key, None)
 
     async def _handle_hash(self, event):
         from html import escape as _h
@@ -1302,78 +1449,53 @@ class TelethonManager:
         )
 
     async def _handle_b64(self, event):
-        from html import escape as _h
+        """`.b64` — единая реализация (utils/shared_cmd) для обоих путей."""
         from utils.hashing import b64_op
+        from utils.shared_cmd import b64_body, parse_b64_args
+
         parts = event.raw_text.strip().split(maxsplit=1)
         args = parts[1] if len(parts) > 1 else ""
         reply = await event.get_reply_message()
         reply_text = reply.raw_text if reply else None
-        if not args and not reply_text:
-            await event.edit(
-            _command_card("Base64", "[?] <code>.b64 текст</code> — encode\n"
-                "<code>.b64 decode текст</code> — decode\n"
-                "<code>.b64 url …</code> — <b>url-safe</b> вариант (-_ вместо +/)\n"
-                "<code>.b64</code> (reply) — encode текста"),
-                parse_mode="html",
-            )
-            return
-        mode = "encode"
-        text = ""
-        url_safe = False
-        if args:
-            parts_list = args.split()
-            url_safe = any(p.lower() in ("url", "urlsafe", "url-safe") for p in parts_list)
-            parts_clean = [p for p in parts_list if p.lower() not in ("url", "urlsafe", "url-safe")]
-            if parts_clean:
-                first = parts_clean[0].lower()
-                if first in ("decode", "d", "dec"):
-                    mode = "decode"
-                    text = " ".join(parts_clean[1:]) if len(parts_clean) > 1 else ""
-                elif first in ("encode", "e", "enc"):
-                    mode = "encode"
-                    text = " ".join(parts_clean[1:]) if len(parts_clean) > 1 else ""
-                else:
-                    text = " ".join(parts_clean)
+
+        mode, text, url_safe = parse_b64_args(args)
         if not text:
             text = reply_text or ""
         if not text:
-            await event.edit(_command_card("Base64", "[x] Нечего кодировать."), parse_mode="html")
+            await event.edit(
+                _command_card(
+                    "Base64",
+                    "[?] <code>.b64 текст</code> — encode\n"
+                    "<code>.b64 decode текст</code> — decode\n"
+                    "<code>.b64 url …</code> — <b>url-safe</b> вариант (-_ вместо +/)\n"
+                    "<code>.b64</code> (reply) — encode текста",
+                ),
+                parse_mode="html",
+            )
             return
+
         result = b64_op(text, mode, url_safe=url_safe)
         if isinstance(result, str) and result.startswith("[x]"):
             await event.edit(_command_card("Base64", result), parse_mode="html")
             return
-        if url_safe:
-            head_label = "url-decode" if mode == "decode" else "url-encode"
-        else:
-            head_label = "decode" if mode == "decode" else "encode"
-        if mode == "decode":
-            res_preview = _h(result[:200] + ("…" if len(result) > 200 else ""))
-            src_preview = _h(text[:60] + ("…" if len(text) > 60 else ""))
-            await event.edit(
-                _command_card("Base64", (
-                f"<b>🔐 b64 {head_label}</b>\n"
-                f"<i>in:</i> <code>{src_preview}</code>\n"
-                f"<i>out ({len(result)} chars):</i> <code>{res_preview}</code>")),
-                parse_mode="html",
-            )
-            return
-        src_preview = _h(text[:60] + ("…" if len(text) > 60 else ""))
         await event.edit(
-            _command_card("Base64", (
-            f"<b>🔐 b64 {head_label}</b>\n"
-            f"<i>in:</i> {src_preview}\n"
-            f"<i>out:</i> <code>{_h(result)}</code>")),
+            _command_card("Base64", b64_body(mode, text, result, url_safe)),
             parse_mode="html",
         )
 
     async def _handle_timezone(self, user_id: str, event):
-        from html import escape as _h
+        """`.timezone` — единая реализация (utils/shared_cmd) для обоих путей.
+
+        Раньше здесь была вторая копия с захардкоженными строками, которая
+        разошлась с `handlers/commands/timezone.py` при первом же правке.
+        """
+        from utils.shared_cmd import timezone_body, timezone_parse
         from utils.storage import get_user_tz, set_user_tz
-        from utils.timezones import _canonicalize, is_reset_value, TZ_PRESETS
+
         parts = event.raw_text.strip().split(maxsplit=1)
         args = parts[1] if len(parts) > 1 else ""
         uid = str(user_id)
+
         if is_reset_value(args):
             set_user_tz(uid, None)
             await event.edit(
@@ -1381,46 +1503,29 @@ class TelethonManager:
                 parse_mode="html",
             )
             return
+
         if not args:
-            cur = get_user_tz(uid)
-            current_line = (
-                f"Сейчас: <code>{_h(cur)}</code>" if cur else "Сейчас: <code>UTC</code> (по умолчанию)"
-            )
-            lines = [
-                "<b>🌍 Часовая зона</b>",
-                current_line,
-                "",
-                "<b>Примеры:</b>",
-                "• <code>.timezone +3</code> — Москва, СПб",
-                "• <code>.timezone -5</code> — Нью-Йорк",
-                "• <code>.timezone +5:30</code> — Индия",
-                "• <code>.timezone Europe/Moscow</code> — по имени",
-                "• <code>.timezone МСК</code> / <code>.timezone киев</code> — алиас",
-                "• <code>.timezone UTC</code> / <code>.timezone reset</code> — сброс",
-                "",
-                "<b>Пресеты:</b>",
-        ]
-            for name, offset, remark in TZ_PRESETS:
-                lines.append(f"• <b>{_h(name)}</b> (<code>{offset}</code>) — {_h(remark)}")
-            lines.append("[i] Применяется к <code>.time</code>.")
             await event.edit(
-                _command_card("Timezone", "\n".join(lines)),
+                _command_card("Timezone", timezone_body(get_user_tz(uid))),
                 parse_mode="html",
             )
             return
-        canonical = _canonicalize(args)
-        if canonical is None:
+
+        ok, canonical = timezone_parse(args)
+        if not ok or canonical is None:
             await event.edit(
-                _command_card("Timezone", "[x] Не знаю таймзону: <code>"
-                f"{_h(args.strip())}"
-                "</code>\nПримеры: <code>.timezone +3</code>, "
-                "<code>.timezone Europe/Moscow</code>, <code>.timezone МСК</code>."),
+                _command_card(
+                    "Timezone",
+                    f"[x] Не знаю таймзону: <code>{_esc(args.strip())}</code>\n"
+                    "Примеры: <code>.timezone +3</code>, "
+                    "<code>.timezone Europe/Moscow</code>, <code>.timezone МСК</code>.",
+                ),
                 parse_mode="html",
             )
             return
         set_user_tz(uid, canonical)
         await event.edit(
-            _command_card("Timezone", f"[OK] TZ: <code>{_h(canonical)}</code>"),
+            _command_card("Timezone", f"[OK] TZ: <code>{_esc(canonical)}</code>"),
             parse_mode="html",
         )
 
@@ -1644,12 +1749,12 @@ class TelethonManager:
         finally:
             # Удаляем исходную команду только если анимация реально
             # отправилась — иначе юзер теряет сообщение без всякого выхлопа.
-            if not anim_sent:
-                return
-            try:
-                await event.delete()
-            except Exception as e:
-                logger.debug(f"_handle_anim {kind}: delete origin failed: {e}")
+            # (`return` в finally подавлял исключения выше — убрано.)
+            if anim_sent:
+                try:
+                    await event.delete()
+                except Exception as e:
+                    logger.debug(f"_handle_anim {kind}: delete origin failed: {e}")
 
     async def _apply_nya(self, user_id: str, event, original_text: str) -> None:
         """Catgirl-rewrite обычного (не-dot) исходящего сообщения юзера.
@@ -1732,7 +1837,7 @@ class TelethonManager:
             return
         if not is_photo_allowed(user_id, event.chat_id, tid):
             return
-        if was_processed(event.chat_id, event.id, tid):
+        if was_processed(event.chat_id, event.id, tid, user_id):
             return
         path = await self.download_view_once(user_id, event.chat_id, event.id, thread_id=tid)
         if not (path and self._bot):
@@ -1823,22 +1928,6 @@ def parse_dot_targets(args: str, limit: int = DOT_TARGET_LIMIT) -> list[str]:
     return out
 
 
-def _esc(s) -> str:
-    """HTML-escape для user-controlled полей (bio, about).
-
-    Дубликат из handlers/inline/profile.py — выносить в общий модуль пока
-    нет смысла (один хелпер).
-    """
-    if s is None:
-        return ""
-    return (
-        str(s)
-        .replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-    )
-
-
 def _detect_avatar_ext(data: bytes) -> str:
     """Определяет расширение файла аватарки по magic bytes.
 
@@ -1859,34 +1948,6 @@ def _detect_avatar_ext(data: bytes) -> str:
     if len(data) >= 12 and data.startswith(b"RIFF") and data[8:12] == b"WEBP":
         return "avatar.webp"
     return "avatar.jpg"
-
-
-def _extract_telethon_usernames(entity, full_user=None) -> list[str]:
-    """Активные usernames: collectibles (Premium) + legacy fallback.
-
-    Приоритет: сначала collectibles из `full_user.usernames`, потом legacy
-    `entity.username` (если не дублирует collectible).
-    """
-    out: list[str] = []
-    if full_user is not None:
-        for u in getattr(full_user, "usernames", None) or []:
-            active = getattr(u, "active", False)
-            uname = getattr(u, "username", None)
-            if active and uname and uname not in out:
-                out.append(uname)
-    legacy = getattr(entity, "username", None)
-    if legacy and legacy not in out:
-        out.append(legacy)
-    return out
-
-
-def render_telethon_usernames(unames: list[str]) -> str:
-    """'Username: @a' (один) или 'Usernames: @a @b' (несколько)."""
-    if not unames:
-        return ""
-    if len(unames) == 1:
-        return f"Username: @{unames[0]}"
-    return "Usernames: " + " ".join(f"@{u}" for u in unames)
 
 
 def _yn(v) -> str:
@@ -1912,10 +1973,14 @@ def _telethon_status(status) -> str:
     return base
 
 
-def _format_me_telethon(s, full_user=None, *, premium_render: bool = False) -> str:
-    """``.me`` карточка. ``premium_render`` управляет рендером эмодзи в заголовке
-    (premium-aware). Индикатор "Premium: ✅" внутри карточки отражает
-    собственный Premium самого юзера (для .me он же sender)."""
+def _format_me_telethon(s, full_user=None) -> str:
+    """``.me`` карточка.
+
+    Раньше был параметр ``premium_render``, который НИ РАЗУ не читался в теле
+    функции, хотя docstring утверждал, что он «управляет рендером эмодзи»,
+    а все три вызова передавали ``is_entity_premium(...)`` (P3.10).
+    Параметр удалён. Индикатор ``Premium: ✅`` внутри карточки
+    отражает собственный Premium цели (для .me это сам юзер)."""
     if not s:
         return _command_card("Me", "[x] Не удалось получить данные.")
     first = getattr(s, "first_name", None) or "—"
@@ -1926,9 +1991,9 @@ def _format_me_telethon(s, full_user=None, *, premium_render: bool = False) -> s
     has_premium = getattr(s, "premium", False)
 
     parts = [f"Имя: {_esc(full)}"]
-    unames = _extract_telethon_usernames(s, full_user)
+    unames = _usernames_of(s, full_user)
     if unames:
-        parts.append(render_telethon_usernames(unames))
+        parts.append(_render_usernames(unames))
     if phone:
         parts.append(f"Телефон: {_esc(phone)}")
     if lang:
@@ -1949,8 +2014,8 @@ def _format_me_telethon(s, full_user=None, *, premium_render: bool = False) -> s
     )
 
 
-def _format_chat_telethon(chat, chat_id: int, full_chat=None, *, premium_render: bool = False) -> str:
-    """``.chat`` карточка. ``premium_render`` управляет эмодзи в заголовке."""
+def _format_chat_telethon(chat, chat_id: int, full_chat=None) -> str:
+    """``.chat`` карточка (``premium_render`` удалён — см. _format_me_telethon)."""
     title = getattr(chat, "title", None) or getattr(chat, "first_name", None) or "—"
     ctype = type(chat).__name__
     members = getattr(chat, "participants_count", None)
@@ -1964,9 +2029,9 @@ def _format_chat_telethon(chat, chat_id: int, full_chat=None, *, premium_render:
         f"Тип: {_esc(ctype)}",
         f"Название: {_esc(title)}",
     ]
-    unames = _extract_telethon_usernames(chat, full_chat)
+    unames = _usernames_of(chat, full_chat)
     if unames:
-        parts.append(render_telethon_usernames(unames))
+        parts.append(_render_usernames(unames))
     if members is not None:
         parts.append(f"Участников: {_esc(members)}")
     flags = []
@@ -1987,12 +2052,12 @@ def _format_chat_telethon(chat, chat_id: int, full_chat=None, *, premium_render:
     return _command_card("Chat", chr(10).join(parts))
 
 
-def _format_who_telethon(s, full_user=None, *, premium_render: bool = False) -> str:
-    """``.who`` карточка (single + multi-target). ``premium_render`` управляет эмодзи в заголовке.
+def _format_who_telethon(s, full_user=None) -> str:
+    """``.who`` карточка (single + multi-target).
 
-    Заголовок (premium emoji) и индикатор Premium внутри карточки — РАЗНЫЕ сущности:
-    - ``premium_render`` (sender_premium) определяет анимированный эмодзи в заголовке;
-    - ``has_premium`` (target's own premium) определяет индикатор "Premium: ✅" в карточке.
+    Параметр ``premium_render`` удалён (P3.10): он никогда не читался в теле
+    функции, в отличие от docstring, который утверждал обратное. Флаг
+    ``premium`` внутри карточки по-прежнему отражает Premium САМОЙ цели.
     """
     if not s:
         return _command_card("Who", "[x] Не удалось получить данные.")
@@ -2014,9 +2079,9 @@ def _format_who_telethon(s, full_user=None, *, premium_render: bool = False) -> 
     status = _telethon_status(getattr(s, "status", None))
 
     parts = [f"ID: <code>{s.id}</code>", f"Имя: {_esc(full)}"]
-    unames = _extract_telethon_usernames(s, full_user)
+    unames = _usernames_of(s, full_user)
     if unames:
-        parts.append(render_telethon_usernames(unames))
+        parts.append(_render_usernames(unames))
     if phone:
         parts.append(f"Телефон: {_esc(phone)}")
     if lang:

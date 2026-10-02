@@ -6,6 +6,7 @@ NB: `ExportChatInviteRequest` и `GetExportedChatInvitesRequest` живут в
 адресуются через `InputPeer` (а не `InputChannel`), так что эти функции
 работают для всех типов чатов.
 """
+from utils.cmds import INVITE_CMDS
 
 from telethon.tl.functions.messages import (
     ExportChatInviteRequest,
@@ -16,14 +17,8 @@ from telethon.errors import ChatAdminRequiredError
 from utils.texts import Texts, render_for_user
 from handlers.commands._base import command_card
 
-INVITE_CMDS = (".ссылка", ".invitelink", ".инвайт", ".invite")
 
 
-def _check(t: str | None) -> bool:
-    if not t:
-        return False
-    head = t.strip().lower().split()[0]
-    return head in INVITE_CMDS
 
 
 async def handle(user_id: str, event) -> None:

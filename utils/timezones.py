@@ -32,13 +32,17 @@ def format_with_tz(tz_label: str) -> tuple[str, object]:
 
     Возвращает (text, tz_obj). tz_label как у юзера: '+3', 'Europe/Moscow',
     'UTC'. Невалидное значение → безопасный fallback на UTC, метка 'UTC'.
+
+    ВАЖНО: возвращается ТОЛЬКО строка времени — без ``<blockquote>`` и без
+    собственного заголовка. Раньше здесь была полная карточка, которую затем
+    ещё раз оборачивал ``Texts.Time.TIME``: получался вложенный
+    ``<blockquote>`` (Telegram отклоняет) И заголовок «Текущее время»,
+    напечатанный дважды. Карточку целиком собирает
+    ``handlers.commands._base.render_time``.
     """
     tz_obj, label = _resolve_tz(tz_label)
     now = datetime.now(tz_obj)
-    return (
-        "<blockquote><b>🕐 Текущее время:</b>\n"
-        f"<code>{now.strftime('%Y-%m-%d %H:%M:%S')}</code> ({label})</blockquote>"
-    ), tz_obj
+    return f"<code>{now.strftime('%Y-%m-%d %H:%M:%S')}</code> ({label})", tz_obj
 
 
 def _resolve_tz(tz_label: Optional[str]) -> tuple:

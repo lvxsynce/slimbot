@@ -112,10 +112,13 @@ def env(tmp_path, monkeypatch):
 # --------------------------------------------------------------------------
 
 def test_dispatch_cmds_match_template_module():
-    """Литерал в telethon_manager не должен разъезжаться с модулем."""
-    from utils.telethon_manager import _TEMPLATE_CMDS
-    assert set(_TEMPLATE_CMDS) == set(T.ALL_CMDS)
+    """Диспетчер и модуль берут алиасы из одного реестра utils.cmds."""
+    from utils import cmds
+    from utils.cmds import TEMPLATE_CMDS
+    assert set(TEMPLATE_CMDS) == set(T.ALL_CMDS)
     assert {".шаб", ".+шаб", ".-шаб"} <= set(T.ALL_CMDS)
+    # реестр — единственный источник, локальных копий быть не должно
+    assert set(cmds.TEMPLATE_CMDS) == set(T.ALL_CMDS)
 
 
 def test_send_gif_template_end_to_end(env):

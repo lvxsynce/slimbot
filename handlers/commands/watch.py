@@ -1,16 +1,19 @@
+import asyncio
+
 from aiogram import Router, types
 
+from config import TELETHON_RESOLVE_TIMEOUT
 from utils.storage import (
     get_chats_for_user,
     add_chat_for_user,
     remove_chat_for_user,
-    is_chat_watched,
     session_exists,
     get_photo_settings,
     update_photo_settings,
 )
 from utils.texts import Texts, render_for_user
 from utils.telethon_manager import telethon_manager
+from utils.shared_cmd import WATCHED_MAX_ROWS, watched_body
 from ._base import command_card
 
 router = Router()
@@ -25,21 +28,32 @@ def _check(cmds: set[str], text: str | None) -> bool:
 
 
 def _auto_enable_photos(user_id: str, chat_id: int, thread_id: int = 0):
+    """Скорректировать режим сохранения фото под новый чат.
+
+    Раньше здесь шёл прямой доступ по ключам (``s["mode"]``, ``s["exceptions"]``).
+    На битой записи в photo_settings это давало KeyError ПОСЛЕ того, как чат
+    уже добавили в watched: чат отслеживался, авто-включение молча ломалось,
+    юзер не получал никакого сообщения. Теперь значения нормализуются через
+    ``get_photo_settings`` (см. utils/storage.load_photo_settings).
+    """
     if not session_exists(user_id):
         return
     s = get_photo_settings(user_id)
+    enabled = bool(s.get("enabled"))
+    mode = s.get("mode", "all")
+    exceptions = s.get("exceptions") or []
     key = [chat_id, thread_id]
-    if s["enabled"] and s["mode"] == "all":
+    if enabled and mode == "all":
         return
-    if s["enabled"] and s["mode"] == "only_selected":
-        if key not in s["exceptions"]:
-            s["exceptions"].append(key)
-            update_photo_settings(user_id, s)
+    if enabled and mode == "only_selected":
+        if key not in exceptions:
+            exceptions.append(key)
+            update_photo_settings(user_id, {**s, "exceptions": exceptions})
         return
-    if s["enabled"] and s["mode"] == "all_except":
-        if key in s["exceptions"]:
-            s["exceptions"].remove(key)
-            update_photo_settings(user_id, s)
+    if enabled and mode == "all_except":
+        if key in exceptions:
+            exceptions.remove(key)
+            update_photo_settings(user_id, {**s, "exceptions": exceptions})
         return
     update_photo_settings(user_id, {"enabled": True, "mode": "only_selected", "exceptions": [key]})
 
@@ -48,19 +62,27 @@ def _disable_photos_for_chat(user_id: str, chat_id: int, thread_id: int = 0):
     if not session_exists(user_id):
         return
     s = get_photo_settings(user_id)
-    if not s["enabled"]:
+    if not s.get("enabled"):
         return
+    mode = s.get("mode", "all")
+    exceptions = list(s.get("exceptions") or [])
     key = [chat_id, thread_id]
-    if s["mode"] == "all":
-        update_photo_settings(user_id, {"enabled": True, "mode": "all_except", "exceptions": [key]})
-    elif s["mode"] == "all_except":
-        if key not in s["exceptions"]:
-            s["exceptions"].append(key)
-            update_photo_settings(user_id, s)
-    elif s["mode"] == "only_selected":
-        if key in s["exceptions"]:
-            s["exceptions"].remove(key)
-            update_photo_settings(user_id, s)
+    if mode == "all":
+        # Раньше здесь dict перезаписывался целиком, и ВСЕ остальные
+        # исключения терялись. В режиме "all" исключения и так не действуют,
+        # но сохранять их нужно — они возвращают силу при переходе в
+        # "all_except".
+        update_photo_settings(
+            user_id, {**s, "mode": "all_except", "exceptions": [key] + exceptions}
+        )
+    elif mode == "all_except":
+        if key not in exceptions:
+            exceptions.append(key)
+            update_photo_settings(user_id, {**s, "exceptions": exceptions})
+    elif mode == "only_selected":
+        if key in exceptions:
+            exceptions.remove(key)
+            update_photo_settings(user_id, {**s, "exceptions": exceptions})
 
 
 def _photo_note(uid: str) -> str:
@@ -166,6 +188,8 @@ async def handle_telethon(user_id: str, event, thread_id: int = 0):
             )
 
     elif head in WATCHED_CMDS:
+        # Общий форматтер (utils/shared_cmd.watched_body): Telethon-путь
+        # передаёт ссылки, aiogram — нет, но карточка одна и та же.
         chats = get_chats_for_user(user_id)
         if not chats:
             text_out = Texts.Watch.WATCHED_EMPTY.render(premium=False)
@@ -173,32 +197,33 @@ async def handle_telethon(user_id: str, event, thread_id: int = 0):
             client = event.client
             me_id = 0
             try:
-                me = await client.get_me()
+                me = await asyncio.wait_for(
+                    client.get_me(), timeout=TELETHON_RESOLVE_TIMEOUT
+                )
                 me_id = me.id
             except Exception:
                 pass
-            header = "<b>Slim bot | Watched chats</b>"
-            lines = [header]
-            for i, entry in enumerate(chats, 1):
-                cid, ttid = entry[0], entry[1]
+            rows = []
+            for cid, ttid in chats[:WATCHED_MAX_ROWS]:
                 link, name = await _resolve_chat_link(client, cid, me_id)
-                title = name or f"чат #{cid}"
-                head_line = f'{i}. <a href="{link}">{esc(title)}</a>'
-                if ttid:
-                    text_out_entry = f"{head_line} · топик <code>{ttid}</code>"
-                else:
-                    text_out_entry = f"{head_line} (весь чат)"
-                lines.append(text_out_entry)
-            text_out = "\n".join(lines)
+                rows.append({"chat_id": cid, "thread_id": ttid, "url": link, "name": name})
+            text_out = watched_body(rows)
         await event.edit(command_card("Watched chats", text_out), parse_mode="html")
 
 
 async def _resolve_chat_link(client, chat_id: int, me_id: int) -> tuple[str, str]:
-    """Возвращает (url, display_name) для chat_id."""
+    """Возвращает (url, display_name) для chat_id.
+
+    RPC обёрнут в ``wait_for``: раньше голый ``get_entity`` в цикле по всем
+    отслеживаемым чатам мог hangs'нуть навсегда — один мёртвый чат вешал
+    `.watched` до внешнего таймаута в 300 с.
+    """
     from utils.escape import esc
     from telethon.tl.types import User
     try:
-        entity = await client.get_entity(chat_id)
+        entity = await asyncio.wait_for(
+            client.get_entity(chat_id), timeout=TELETHON_RESOLVE_TIMEOUT
+        )
     except Exception:
         return f"tg://user?id={chat_id}", None
 
@@ -331,18 +356,19 @@ async def cmd_dot_watched_private(message: types.Message):
 
 
 async def _send_watched_list(message: types.Message, user_id: str):
+    """`.watched` — тот же форматтер, что и в Telethon-пути.
+
+    Здесь нет MTProto-клиента, поэтому сущности резолвить нечем: строки
+    строятся без `url`, и `watched_body` печатает голый `chat_id`. Формат
+    карточки (нумерация, «весь чат»/топик, обрезка длинного списка) — общий.
+    """
     chats = get_chats_for_user(user_id)
     if not chats:
         text = Texts.Watch.WATCHED_HINT.render(premium=False)
     else:
-        header = Texts.Watch.WATCHED_HEADER.render(premium=False)
-        lines = [header + "\n"]
-        for i, entry in enumerate(chats, 1):
-            cid, ttid = entry[0], entry[1]
-            if ttid:
-                lines.append(f"{i}. <code>{cid}</code> · топик <code>{ttid}</code>")
-            else:
-                lines.append(f"{i}. <code>{cid}</code> (весь чат)")
-        text = "\n".join(lines)
-
+        rows = [
+            {"chat_id": cid, "thread_id": ttid, "url": None, "name": None}
+            for cid, ttid in chats
+        ]
+        text = watched_body(rows)
     await message.reply(command_card("Watched chats", text))

@@ -7,6 +7,7 @@ from datetime import datetime, timezone as tz
 
 from aiogram import Router, types
 
+from utils import rate_limit_gate as gate
 from utils.escape import esc
 from ._base import command_card, thread_kwargs
 
@@ -137,8 +138,25 @@ def _check(text: str | None) -> bool:
     return t in (".опенкод", ".opencode")
 
 
+async def _limited(uid: str) -> bool:
+    """Лимит на `.опенкод` через единый гейт.
+
+    Внешний HTTP-сервис, доступный любому, кто нашёл бота; раньше лимита
+    не было ни здесь, ни в Telethon-пути.
+    """
+    return gate.check(".опенкод", uid)
+
+
 @router.message(lambda msg: _check(msg.text))
 async def cmd_opencode_private(message: types.Message):
+    from utils.premium import resolve_effective_uid
+    uid = await resolve_effective_uid(message)
+    if not await _limited(uid):
+        await message.reply(
+            command_card("OpenCode", "[x] Слишком много запросов. Подожди немного."),
+            parse_mode="html", **thread_kwargs(message),
+        )
+        return
     stats = await fetch_opencode_stats()
     text = (
         format_opencode_stats(stats)
@@ -150,6 +168,7 @@ async def cmd_opencode_private(message: types.Message):
 
 async def handle(user_id: str, event):
     """Telethon-вызов из telethon_manager._handle_outgoing."""
+    # Лимит уже проверен в _handle_outgoing (`.opencode` в списке network).
     stats = await fetch_opencode_stats()
     text = (
         format_opencode_stats(stats)

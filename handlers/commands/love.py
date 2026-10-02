@@ -10,10 +10,11 @@ import logging
 
 from aiogram import Router, types
 
-from ._base import thread_kwargs
+from ._base import command_card, thread_kwargs
+from utils import rate_limit_gate as gate
+from utils.premium import resolve_effective_uid
 from utils.storage import was_processed
 from utils.texts import Texts, render_for_user
-from utils.premium import resolve_effective_uid
 
 logger = logging.getLogger(__name__)
 
@@ -163,10 +164,20 @@ async def _do_anim(
     final_text_obj,
 ) -> None:
     """Единая точка для aiogram private. Шлёт анимацию + удаляет команду."""
+    # P8.7: анимация = 21 `editMessageText`. FloodWait от неё ест бюджет
+    # ОБЩЕГО токена бота, то есть бьёт по ВСЕМ пользователям сразу — значит,
+    # лимит обязателен и здесь, а не только в Telethon-пути.
+    uid = await resolve_effective_uid(message)
+    if not gate.check(".love", uid):
+        await message.reply(
+            command_card("Love", gate.RATE_LIMIT_TEXT), **thread_kwargs(message)
+        )
+        return
     if was_processed(
         message.chat.id,
         message.message_id,
         getattr(message, "message_thread_id", None),
+        getattr(getattr(message, "from_user", None), "id", None),
     ):
         return
     # Первое сообщение бота — уже полный кадр (marker совпадает с variant),
@@ -174,7 +185,6 @@ async def _do_anim(
     msg = await message.answer(
         make_frame(rows, marker, marker), **thread_kwargs(message)
     )
-    uid = await resolve_effective_uid(message)
     await _run_anim(
         msg,
         rows=rows,

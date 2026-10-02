@@ -20,24 +20,19 @@ Layout: прямоугольный, avatar слева вверху, semi-transpa
 
 Если Pillow/font недоступны или render fails → graceful fallback на HTML.
 """
+from utils.cmds import QUOTE_CMDS
 import asyncio
 import html as _html
 import logging
 
-QUOTE_CMDS = (".quote", ".цитата", ".q", ".цит")
+
 
 QUOTE_VIDEO_MAX_BYTES = 20 * 1024 * 1024
 
 logger = logging.getLogger(__name__)
 
+from utils.escape import esc as _esc
 from ._base import command_card
-
-
-def _esc(s, *, quote: bool = False) -> str:
-    """HTML-escape для user-controlled полей (Telethon ответы)."""
-    if s is None:
-        return ""
-    return _html.escape(str(s), quote=quote)
 
 
 def _truncate(text: str, n: int = 2000) -> str:
@@ -134,8 +129,8 @@ async def _sticker_to_quote_media(data: bytes) -> tuple[bytes | None, bytes | No
     )
     frames, durations = [], []
     if data[:2] == b"\x1f\x8b":
-        # TGS: rlottie (CPU-bound, но быстрый — десятки кадров 128px).
-        frames = tgs_to_rgba_frames(data)
+        # TGS: rlottie (CPU-bound, десятки кадров 128px) — в поток.
+        frames = await _to_thread(tgs_to_rgba_frames, data)
         if frames:
             durations = webm_frame_durations(len(frames))
     elif data[:4] in (b"RIFF", b"\x89PNG", b"\xff\xd8\xff") or data[:6] in (
@@ -153,10 +148,11 @@ async def _sticker_to_quote_media(data: bytes) -> tuple[bytes | None, bytes | No
         # Ничего не декодировалось — отдаём как есть (напр. статичный webp).
         return None, data
     if len(frames) > 1:
-        gif = frames_to_gif_bytes(frames, durations)
+        gif = await _to_thread(frames_to_gif_bytes, frames, durations)
         if gif:
             return gif, None
-    return None, rgba_frame_to_png_bytes(frames[0])
+    first = frames[0]
+    return None, await _to_thread(rgba_frame_to_png_bytes, first)
 
 
 def _custom_emoji_spans(reply) -> list[tuple[int, int, int]]:
@@ -218,6 +214,17 @@ def _apply_emoji_placeholders(text: str, spans: list[tuple[int, int, int]],
         return text, {}
 
 
+async def _to_thread(fn, *args):
+    """CPU-bound (Pillow/rlottie) — в поток, иначе встаёт весь event loop.
+
+    Один `.q` держит в RAM до 40 RGBA-кадров (bot.log: 188 КБ → 7.4 МБ),
+    и вся эта работа шла прямо в корутине: Telethon-клиенты всех
+    пользователей в эти секунды не могли прочитать сокет.
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, lambda: fn(*args))
+
+
 def _pillow_first_frame(data: bytes):
     """Статика (webp/png/jpeg/gif) → ([RGBA], [100]). ([], []) если битое."""
     if not data:
@@ -270,7 +277,7 @@ async def _fetch_custom_emoji(client, doc_ids) -> dict:
                 data = await asyncio.wait_for(
                     client.download_media(doc, file=bytes), timeout=20)
                 from utils.gif_converter import tgs_to_rgba_frames
-                frames = tgs_to_rgba_frames(data) if data else []
+                frames = await _to_thread(tgs_to_rgba_frames, data) if data else []
                 how = "rlottie"
                 if not frames:
                     # rlottie недоступен / TGS битый → статичный ПРЕВЬЮ-кадр
@@ -289,7 +296,7 @@ async def _fetch_custom_emoji(client, doc_ids) -> dict:
                             tb = None
                         if not tb:
                             continue
-                        frames, durations = _pillow_first_frame(tb)
+                        frames, durations = await _to_thread(_pillow_first_frame, tb)
                         if frames:
                             how = f"thumb[{idx}]"
                             break
@@ -310,7 +317,7 @@ async def _fetch_custom_emoji(client, doc_ids) -> dict:
                     webm_frame_durations, webm_to_rgba_frames)
                 frames = await webm_to_rgba_frames(data)
                 if not frames:
-                    frames, durations = _pillow_first_frame(data), [100]
+                    frames, durations = await _to_thread(_pillow_first_frame, data), [100]
                 else:
                     durations = webm_frame_durations(len(frames))
                 logger.warning(
@@ -320,7 +327,9 @@ async def _fetch_custom_emoji(client, doc_ids) -> dict:
             else:
                 data = await asyncio.wait_for(
                     client.download_media(doc, file=bytes), timeout=20)
-                frames, durations = _pillow_first_frame(data) if data else ([], [])
+                frames, durations = (
+                    await _to_thread(_pillow_first_frame, data) if data else ([], [])
+                )
                 logger.warning(
                     "quote emoji: doc=%s mime=%s static_bytes=%s frames=%s",
                     doc_id, mime, len(data or b""), len(frames),
@@ -344,7 +353,10 @@ def _select_anim_phases(n_frames: int, cap: int = 8) -> list[int]:
 
 
 def _decode_emoji_frame(data: bytes, mime: str):
-    """Legacy: первый кадр → PIL RGBA. Используется тестами."""
+    """Legacy: первый кадр → PIL RGBA. Синхронная (используется тестами).
+
+    Продакшн-код сюда не ходит: он уже разворачивает кадры через `_to_thread`.
+    """
     if (mime or "") in _ANIMATED_STICKER_MIMES:
         return None
     frames, _ = _pillow_first_frame(data)

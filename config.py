@@ -130,10 +130,56 @@ AUTH_STATE_TTL = _int_env("AUTH_STATE_TTL", 300)
 
 # Auth-state cleanup loop period (seconds).
 AUTH_CLEAN_INTERVAL = _int_env("AUTH_CLEAN_INTERVAL", 60)
+# Кому разрешено подключать Telethon-сессию (свой аккаунт).
+# Пустой список = открытый режим (совместимость с одиночным использованием),
+# но в лог при каждом подключении пишется WARNING.
+# Несколько id через запятую: SESSION_ALLOWLIST=111,222
+SESSION_ALLOWLIST = {
+    part.strip()
+    for part in os.getenv("SESSION_ALLOWLIST", "").replace(";", ",").split(",")
+    if part.strip()
+}
+
+# Максимум одновременно активных Telethon-клиентов в одном процессе.
+# 0 = без ограничений. Раньше лимита не было вовсе, и 200 сохранённых сессий
+# поднимались одновременным asyncio.gather на старте — это гарантированный
+# flood-control по IP/API_ID.
+MAX_ACTIVE_SESSIONS = _int_env("MAX_ACTIVE_SESSIONS", 0)
+
+# Подъём сессий на старте идёт ВОЛНАМИ, а не одним залпом: все аккаунты
+# делят одни API_ID/API_HASH, и N одновременных connect() от одного IP —
+# верный путь в FloodWait. Пауза между волнами даёт Telegram отдышаться.
+SESSION_START_BATCH = _int_env("SESSION_START_BATCH", 5)
+SESSION_START_DELAY = _float_env("SESSION_START_DELAY", 2.0)
+
 # Auth attempts are limited per user to reduce abuse and Telegram FloodWaits.
 AUTH_MAX_ATTEMPTS = _int_env("AUTH_MAX_ATTEMPTS", 5)
 AUTH_ATTEMPT_WINDOW = _int_env("AUTH_ATTEMPT_WINDOW", 600)
 AUTH_COOLDOWN = _int_env("AUTH_COOLDOWN", 60)
+
+# ----------------- Модули (пользовательский код) -----------------
+#
+# Модуль — это .py-файл, который юзер присылает боту в личку и который
+# добавляет свои dot-команды / inline-команды. Код исполняется В ПРОЦЕССЕ
+# бота, поэтому «песочницы» здесь нет by design: модуль может импортировать
+# utils.*, handlers.* и делать с ними что угодно (см. modules_dev.md,
+# раздел «Модель доверия»). Поэтому гейт доступа обязателен:
+#
+#   MODULE_ALLOWLIST=111,222  — пустой список = открытый режим (WARNING в лог).
+#   MODULES_ENABLED=0         — выключить подсистему целиком, ничего не грузится.
+#   MODULES_MAX_FILES=5       — сколько модулей держит один юзер.
+#   MODULES_MAX_BYTES=262144   — потолок на размер одного .py (файл приходит
+#                                через Bot API, там потолок 20 MB — слишком много).
+#   MODULES_COMMAND_TIMEOUT=60 — обёртка на каждый вызов хендлера модуля.
+MODULE_ALLOWLIST = {
+    part.strip()
+    for part in os.getenv("MODULE_ALLOWLIST", "").replace(";", ",").split(",")
+    if part.strip()
+}
+MODULES_ENABLED = int(os.getenv("MODULES_ENABLED", "1")) != 0
+MODULES_MAX_FILES = _int_env("MODULES_MAX_FILES", 5)
+MODULES_MAX_BYTES = _int_env("MODULES_MAX_BYTES", 256 * 1024)
+MODULES_COMMAND_TIMEOUT = _int_env("MODULES_COMMAND_TIMEOUT", 60)
 # Expensive command limits, applied per user and operation.
 EXPENSIVE_COMMAND_LIMIT = _int_env("EXPENSIVE_COMMAND_LIMIT", 6)
 EXPENSIVE_COMMAND_WINDOW = _int_env("EXPENSIVE_COMMAND_WINDOW", 60)
@@ -181,8 +227,21 @@ TELETHON_RECONNECT_MAX_DELAY = _int_env("TELETHON_RECONNECT_MAX_DELAY", 60)
 TELETHON_HEALTH_INTERVAL = _int_env("TELETHON_HEALTH_INTERVAL", 60)
 TELETHON_HEALTH_TIMEOUT = _int_env("TELETHON_HEALTH_TIMEOUT", 15)
 
-# Inline cache_time для default dispatcher'а (handlers/inline/__init__.py).
+# Inline cache_time. Раньше числа жили константами в самих модулях
+# handlers/inline/* — их нельзя было подкрутить без правки кода.
+# Кеш общий на ТЕКСТ запроса, поэтому разные команды кешируются по-разному:
+#   неизвестный запрос  — короткий, текст зависит только от username бота;
+#   помощь / профиль   — статичные, держат долго;
+#   статус             — там аптайм и живой пинг, кеш короткий;
+#   «нужна сессия»     — намеренно быстрый: юзер только что нажал /start
+#                        и перезапрашивает inline, старый ответ в кеше
+#                        показывал бы «нужна сессия» ещё минуту.
 INLINE_CACHE_DEFAULT = _int_env("INLINE_CACHE_DEFAULT", 60)
+INLINE_CACHE_HELP = _int_env("INLINE_CACHE_HELP", 300)
+INLINE_CACHE_STATUS = _int_env("INLINE_CACHE_STATUS", 15)
+INLINE_CACHE_PROFILE = _int_env("INLINE_CACHE_PROFILE", 300)
+INLINE_CACHE_PROFILE_MULTI = _int_env("INLINE_CACHE_PROFILE_MULTI", 180)
+INLINE_CACHE_LOCKED = _int_env("INLINE_CACHE_LOCKED", 10)
 
 # AI .ии — extended features
 # Максимум раундов автокоманд (.who / .net / .tr и т.п.) за один запрос LLM.
@@ -245,6 +304,11 @@ TEMPLATES_FILE = DATA_DIR / "templates.json"
 TEMPLATES_DIR = DATA_DIR / "templates"
 KNOWLEDGE_DB_FILE = DATA_DIR / "knowledge.sqlite3"
 KNOWLEDGE_SETTINGS_FILE = DATA_DIR / "knowledge_settings.json"
+# Модули: исходники в modules/<user_hash>/<name>.py, метаданные (включён/выключен,
+# установлен_at) — в modules.json. Хранилище пользовательское, поэтому
+# путь хэшируется тем же способом, что sessions/ и templates/.
+MODULES_FILE = DATA_DIR / "modules.json"
+MODULES_DIR = DATA_DIR / "modules"
 
 SESSIONS_DIR = DATA_DIR / "sessions"
 TEMP_DIR = DATA_DIR / "temp"

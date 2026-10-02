@@ -204,25 +204,37 @@ def test_who_summary_escapes_user_input():
 
 
 def test_health_loop_survives_iteration_error(monkeypatch):
+    """Цикл обязан пережить исключение одной итерации.
+
+    Раньше здесь стоял фиксированный `asyncio.sleep(0.06)` и утверждение
+    `len(calls) >= 2` — 6-кратный запас по времени на модуле, который сам
+    работает 15–33 с. Под нагрузкой полного прогона тест падал (flake).
+    Теперь ждём события, а не стенного времени.
+    """
     monkeypatch.setattr(tm, "TELETHON_HEALTH_INTERVAL", 0.01)
     mgr = TelethonManager()
     calls = []
+    second_call = asyncio.Event()
 
     async def flaky():
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("boom")
+        second_call.set()
         return {}
 
     async def go():
         mgr.check_clients_health = flaky
         task = asyncio.create_task(mgr._health_check_loop())
-        await asyncio.sleep(0.06)
-        task.cancel()
         try:
-            await task
-        except asyncio.CancelledError:
-            pass
+            # Ждём второго вызова с большим таймаутом, а не фиксированной паузы.
+            await asyncio.wait_for(second_call.wait(), timeout=5.0)
+        finally:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
         return len(calls) >= 2
 
     assert asyncio.run(go()) is True

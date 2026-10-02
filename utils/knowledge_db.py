@@ -2,8 +2,13 @@
 
 SQLite FTS5 входит в стандартную библиотеку Python и позволяет не зависеть от
 внешнего сервиса. Все записи привязаны к владельцу Telethon-сессии.
+
+ВАЖНО: все функции этого модуля СИНХРОННЫ и бьют по диску. Из корутин их
+нельзя звать напрямую — замеры на реальной базе показали до 10 с блокировки
+event loop (DELETE) и 1.9 с (VACUUM). Используйте :func:`run_db`.
 """
 
+import asyncio
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -27,7 +32,11 @@ def _path(path: Path | None) -> Path:
 def _connect(path: Path | None = None):
     """Соединение с явным commit/close после блока (до этого каждый вызов
     держал соединение до сборки мусора — на 500MB-базе это сотни живых conn;
-    без явного commit все записи молча откатывались при close)."""
+    без явного commit все записи молча откатывались при close).
+
+    Синхронная функция: её НЕЛЬЗЯ вызывать из корутины напрямую — замеры на
+    реальной 525 МБ базе показали 52–114 мс на ``count_messages`` и 10.3 с на
+    ``DELETE`` 200k строк. Используйте :func:`run_db` (offload в поток)."""
     conn = sqlite3.connect(_path(path))
     try:
         conn.row_factory = sqlite3.Row
@@ -37,6 +46,15 @@ def _connect(path: Path | None = None):
         conn.commit()
     finally:
         conn.close()
+
+
+async def run_db(fn, *args, **kwargs):
+    """Выполнить синхронную DB-функцию в потоке, не блокируя event loop.
+
+    ALL async-вызывающие knowledge_db обязаны идти через эту обёртку: тогда
+    Telethon-клиенты продолжают читать сокеты, пока идёт тяжёлый запрос.
+    """
+    return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def initialize(path: Path | None = None) -> None:
@@ -313,19 +331,32 @@ def prune_owner(owner_id: str, keep_n: int) -> int:
 
 
 def clear_owner(owner_id: str) -> None:
-    """Полный сброс данных владельца (при logout). После DELETE запускает
-    VACUUM, чтобы физически вернуть место системе — иначе 500MB-файл БД
-    остаётся «убитым» за счёт deleted-страниц."""
+    """Полный сброс данных владельца (при logout).
+
+    Раньше здесь после DELETE запускался ``VACUUM``. Это глобальная
+    блокировка ВСЕЙ общей базы: на реальном файле в 525 МБ один logout
+    замораживал процесс на ~12 с (10.3 с DELETE + 1.9 с VACUUM), и все
+    остальные пользователи стояли колом.
+
+    Теперь VACUUM не выполняется: файл сам отдаёт freed-страницы ОС, а
+    место на диске вернётся при следующем обслуживании. Взамен файловая
+    система освобождает страницы сразу и без эксклюзивного лока.
+    """
     initialize()
     with _LOCK:
         with _connect() as conn:
             conn.execute("DELETE FROM kb_messages WHERE owner_id=?", (str(owner_id),))
             conn.execute("DELETE FROM kb_dialogs WHERE owner_id=?", (str(owner_id),))
             conn.execute("DELETE FROM kb_collections WHERE owner_id=?", (str(owner_id),))
-        try:
-            # VACUUM нельзя внутри транзакции — отдельное соединение, после commit.
-            with _connect() as conn:
-                conn.execute("VACUUM")
-        except Exception:
-            # VACUUM на большой БД может упереться в диск/lock — не критично.
-            pass
+
+
+def vacuum() -> None:
+    """Ручная обслуживающая операция (перекомпакция файла).
+
+    НЕ вызывается автоматически: держит эксклюзивный лок по всей базе.
+    Оператор может позвать её вручную, когда бот простаивает.
+    """
+    initialize()
+    with _LOCK:
+        with _connect() as conn:
+            conn.execute("VACUUM")

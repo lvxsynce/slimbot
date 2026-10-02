@@ -61,11 +61,19 @@ def _status_lines(user_id: str, has_session: bool, uptime_s: float) -> list[str]
 async def cmd_status(message: types.Message):
     from utils.premium import resolve_effective_uid
     from handlers.inline import uptime_seconds
+    from handlers.session import session_allowed
     uid = await resolve_effective_uid(message)
     user_id = str(message.from_user.id)
     has_ss = session_exists(user_id)
-    session_line = await render_for_user(
-        uid, Texts.Status.CONNECTED if has_ss else Texts.Status.DISCONNECTED
-    )
-    body = session_line + "\n" + "\n".join(_status_lines(user_id, has_ss, uptime_seconds()))
+    if has_ss:
+        session_line = await render_for_user(uid, Texts.Status.CONNECTED)
+    elif not session_allowed(user_id):
+        # Не показываем «нажми /start → Включить», если подключение запрещено.
+        session_line = "[x] Подключение недоступно"
+    else:
+        session_line = await render_for_user(uid, Texts.Status.DISCONNECTED)
+    lines = _status_lines(user_id, has_ss, uptime_seconds())
+    if not has_ss and not session_allowed(user_id):
+        lines = [line for line in lines if "Нажми /start" not in line]
+    body = session_line + "\n" + "\n".join(lines)
     await message.answer(command_card("Status", body), **thread_kwargs(message))

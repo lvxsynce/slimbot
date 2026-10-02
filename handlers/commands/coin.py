@@ -20,12 +20,20 @@ def _check(text: str | None) -> bool:
     return head in COIN_CMDS
 
 
+def flip() -> tuple[str, str]:
+    """Одна реализация броска для обоих путей.
+
+    Telethon-путь повторял эти же 4 строки отдельно, и при правке одна из
+    копий inevitably разъезжалась (текст или формат).
+    """
+    result = random.choice(["орёл", "решка"])
+    return result, (Texts.Coin.HEAD if result == "орёл" else Texts.Coin.TAIL)
+
+
 async def _send(message: types.Message):
     from utils.premium import resolve_effective_uid
     uid = await resolve_effective_uid(message)
-    result = random.choice(["орёл", "решка"])
-    text_obj = Texts.Coin.HEAD if result == "орёл" else Texts.Coin.TAIL
-    return await render_for_user(uid, text_obj)
+    return await render_for_user(uid, flip()[1])
 
 
 @router.message(lambda msg: _check(msg.text))

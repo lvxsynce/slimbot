@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 _PREMIUM_CACHE: dict[str, tuple[bool, float]] = {}
 _CACHE_TTL = 300.0  # секунд
 _CACHE_LOCKS: dict[str, asyncio.Lock] = {}
+#: Таймаут RPC. На этом пути висящий get_me() блокировал бы все команды
+#: пользователя (render_for_user зовётся почти везде).
+_PREMIUM_RPC_TIMEOUT = 10.0
 
 
 def _cache_key(user_id: int | str | None) -> Optional[str]:
@@ -114,7 +117,11 @@ async def is_user_premium(user_id: int | str | None) -> bool:
             return False
 
         try:
-            me = await client.get_me()
+            # Таким же таймаутом, как и остальные RPC в проекте. Раньше голый
+            # `await client.get_me()` мог виснуть бесконечно, удерживая
+            # per-user lock — и тогда КАЖДАЯ следующая команда этого юзера
+            # (в т.ч. `.love` после 21 edit'а) вставала в очередь.
+            me = await asyncio.wait_for(client.get_me(), timeout=_PREMIUM_RPC_TIMEOUT)
             premium = bool(getattr(me, "premium", False))
             _cache_set(key, premium)
             return premium

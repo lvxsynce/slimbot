@@ -1,4 +1,5 @@
 """Команда .tagall / .все — тегнуть всех в группе. Telethon-only."""
+from utils.cmds import TAGALL_CMDS
 
 from telethon.tl.types import ChannelParticipantAdmin, ChannelParticipantCreator
 from telethon.errors import ChatAdminRequiredError
@@ -7,14 +8,8 @@ from utils.texts import Texts, render_for_user
 from utils.telethon_manager import telethon_reply_to
 from handlers.commands._base import command_card
 
-TAGALL_CMDS = (".tagall", ".тегвсех", ".все")
 
 
-def _check(t: str | None) -> bool:
-    if not t:
-        return False
-    head = t.strip().lower().split()[0]
-    return head in TAGALL_CMDS
 
 
 async def handle(user_id: str, event) -> None:

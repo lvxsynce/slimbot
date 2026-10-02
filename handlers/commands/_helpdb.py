@@ -54,7 +54,7 @@ HELPS: dict[str, dict[str, str]] = {
     },
     "watch": {
         "syntax": ".watch [@user|id]  |  .следить",
-        "desc": "Начать отслеживать удаления в чате. Без аргумента — текущий чат. С сессией: @username или -100... ID.",
+        "desc": "Отслеживать чат для сохранения одноразовых фото. Без аргумента — текущий чат (или текущий топик форума). С сессией: @username или -100... ID.",
     },
     "unwatch": {
         "syntax": ".unwatch  |  .хватит  |  .забыть",
@@ -76,7 +76,7 @@ HELPS: dict[str, dict[str, str]] = {
         "syntax": ".tr [lang] &lt;text|reply&gt;  |  .перевод • .tr auto [lang]",
         "desc": "Перевод через нейросеть с сохранением стиля и сленга. Без lang — на русский. "
         "Пример: <code>.tr en привет</code>.\n\n"
-        "С сессией: <code>.tr auto en</code> — AI-автоперевод входящих сообщений в этом чате "
+        "С сессией: <code>.tr auto en</code> — AI-автоперевод своих исходящих сообщений в этом чате "
         "на английский, <code>.tr stop</code> — выключить, <code>.tr list</code> — список.",
     },
     "calc": {
@@ -101,12 +101,12 @@ HELPS: dict[str, dict[str, str]] = {
     },
     "hash": {
         "syntax": ".hash &lt;алг&gt; &lt;text|reply&gt;  |  .хеш",
-        "desc": "Хеш текста (md5/sha1/sha256/sha512/sha224/sha384/blake2b/blake2s). "
+        "desc": "Хеш текста или файла по reply (md5, sha1, sha224, sha256, sha384, sha512, sha3_256, sha3_512, blake2b, blake2s). "
                 "Если reply на документ/фото/видео/аудио — хеш скачанного файла.",
     },
     "uuid": {
         "syntax": ".uuid [N]  |  .юид",
-        "desc": "До 20 UUIDv4 за раз. <code>.uuid</code> — один штука, <code>.uuid 5</code> — пять.",
+        "desc": "До 20 UUIDv4 за раз. <code>.uuid</code> — один, <code>.uuid 5</code> — пять.",
     },
     "admins": {
         "syntax": ".admins  |  .админы",
@@ -163,7 +163,7 @@ HELPS: dict[str, dict[str, str]] = {
     },
     "quote": {
         "syntax": ".quote  |  .цитата  |  .q  |  .цит",
-        "desc": "Красиво оформить replied сообщение В ВИДЕ PNG-картинки (1200px): timestamp, sender, "
+        "desc": "Красиво оформить replied сообщение В ВИДЕ PNG-картинки (1400px): timestamp, sender, "
                 "текст, forward-info. Фон — фото из реплая (blur). Видео/кружки/GIF в реплае → анимированная "
                 "GIF-цитата (кружок — круглой маской). Голосовое/аудио в реплае → mp4-цитата со звуком. "
                 "Анимированные Premium-эмодзи (TGS/WEBM) рисуются как inline-картинки и анимируются в GIF-цитате. "
@@ -201,11 +201,11 @@ HELPS: dict[str, dict[str, str]] = {
     "vgf": {
         "syntax": ".вгф [reply]  |  .vfg  |  .gif",
         "desc": (
-            "Ответь этой командой на <b>статичное фото</b> — бот скачает его, "
-            "сделает 2-кадровую GIF с микро-wobble (1px) и отправит ответом на оригинальное фото. "
+            "Ответь на фото — бот сделает 2-кадровую GIF и отправит ответом на оригинал. "
+            "Видео, кружки и анимированные фото конвертируются в настоящую анимированную GIF "
+            "(ffmpeg, до 8 с, ширина до 720px). "
             "Telegram auto-конвертирует multi-frame GIF в inline-playable preview.<br><br>"
-            "<i>Сейчас НЕ поддерживаются: видео (mp4), стикеры (webp/tgs), анимированные фото (round video).</i><br><br>"
-            "Только с Telethon-сессией."
+            "Требует ffmpeg в PATH. Только с Telethon-сессией."
         ),
     },
 }
@@ -230,7 +230,7 @@ _PAIRS = {
     "watched": ["watched", "список"],
     "net": ["net", "сеть", "сет"],
     "del": ["del", "удалить"],
-    "tr": ["tr", "перевод", "перевести"],
+    "tr": ["tr", "перевод", "пер", "перевести"],
     "calc": ["calc", "калк"],
     "save": ["save", "сохранить"],
     "logout": ["logout"],
@@ -244,8 +244,12 @@ _PAIRS = {
     "invitelink": ["ссылка", "invitelink", "инвайт", "invite"],
     "coin": ["монетка", "coin", "монета", "орёл", "решка"],
     "quote": ["quote", "цитата", "q", "цит"],
-    "template": ["шаб", "шаблон", "template", "tmpl", "tpl"],
-    "ai": ["ии", "ai"],
+    "template": [
+        "шаб", "шаблон", "template", "tmpl", "tpl",
+        "+шаб", "+шаблон", "+template", "+tmpl", "+tpl",
+        "-шаб", "-шаблон", "-template", "-tmpl", "-tpl",
+    ],
+    "ai": ["ии", "ai", "ии?"],
     "timezone": ["timezone", "таймзона", "tz"],
     "b64": ["b64", "base64"],
     "opencode": ["опенкод", "opencode"],

@@ -27,7 +27,6 @@
 Как использовать в handler'е::
 
     from utils.texts import Texts, render_for_user
-    text = await render_for_user(uid, Texts.Ping.PING, ms="23")
     await message.edit_text(text)
 
 Или для случая, когда у нас уже есть Telethon entity (без лишнего I/O)::
@@ -104,6 +103,14 @@ class Text:
     def render(self, *, premium: bool = False, **values: Any) -> str:
         """Подставляет эмодзи (premium-aware) + значения из ``values``.
 
+        ВНИМАНИЕ: это НЕ второй конструктор карточек. Заголовок и обёртка
+        здесь — только для обратной совместимости со старыми шаблонами,
+        которые сами приносили готовый ``<b>Slim bot | …</b>``. Новый код
+        обязан звать ``handlers.commands._base.command_card(title, body)`` —
+        он единственный умеет корректно обрезать текст до лимита Telegram
+        (по UTF-16) и закрывать теги. Здесь троттлинга нет, поэтому длинный
+        результат этого метода рискует упереться в BadRequest.
+
         Args:
             premium: True если у отправителя есть Telegram Premium.
             **values: Значения для не-emoji плейсхолдеров.
@@ -153,12 +160,24 @@ class Text:
             command = re.search(r"\.([a-zа-я]+)", self.comment.lower())
             label = command.group(1).capitalize() if command else "Result"
             return f"<b>Slim bot | {label}</b>\n<blockquote>{plain_quote.group(1).strip()}</blockquote>"
-        return out
+        return _fit_telegram(out)
 
 
 # ============================================================
 # Render helpers
 # ============================================================
+
+
+def _fit_telegram(html: str) -> str:
+    """Обрезать до лимита Telegram по UTF-16 (ленивый импорт — цикл).
+
+    Раньше `Text.render` возвращал текст как есть: длинная выдача
+    `render_for_user(...)` уходила в Telegram целиком и получала BadRequest,
+    тогда как всё, что шло через `command_card`, обрезалось. Теперь
+    обрезаются оба — одной и той же функцией.
+    """
+    from handlers.commands._base import _truncate
+    return _truncate(html)
 
 
 async def render_for_user(uid: int | str | None, text: Text, **values: Any) -> str:
@@ -227,22 +246,6 @@ class Texts:
     class Ping:
         """``.ping`` / ``.пинг`` — задержка между отправкой и обработкой."""
 
-        PING = Text(
-            template=(
-                "<b>Slim bot | Ping</b>\n"
-                "<blockquote>\n"
-                "Telegram API RTT: <code>{ms}ms</code>\n"
-                "</blockquote>"
-            ),
-            emojis={
-                "pong": Emoji(
-                    fallback="🏓",
-                    premium_id=None,
-                    comment="заголовок 'Pong!'",
-                ),
-            },
-            comment=".ping — основной ответ. values: ms=str(ping_ms)",
-        )
 
     # ----------------------------------------------------------------
     # .time
@@ -250,12 +253,13 @@ class Texts:
     class Time:
         """``.time`` / ``.время`` — текущее время в таймзоне юзера."""
 
+        # Без собственного <blockquote>: карточку (header + blockquote) собирает
+        # handlers.commands._base.render_time. Раньше шаблон оборачивал уже
+        # готовый результат format_with_tz, давая вложенный blockquote.
         TIME = Text(
             template=(
-                "<blockquote>"
                 "{clock} <b>Текущее время</b>\n"
                 "{now}"
-                "</blockquote>"
             ),
             emojis={
                 "clock": Emoji(
@@ -308,17 +312,6 @@ class Texts:
 
         # Внешний «холодный» цвет (бьющиеся шаги) — 7 цветов.
         # У этих эмодзи нет premium-версий; premium-логика не нужна.
-        FRAME_EAGLE = Text(
-            template="{emoji}",
-            emojis={
-                "emoji": Emoji(
-                    fallback="❤️",
-                    premium_id=None,
-                    comment="центральный символ в кадре сердечка",
-                ),
-            },
-            comment=".love — один кадр сердечка. values: (нет)",
-        )
 
         # Финальная подпись после анимации.
         LOVE_YOU = Text(
@@ -382,17 +375,6 @@ class Texts:
     class Me:
         """``.me`` / ``.я`` — карточка своего профиля."""
 
-        TITLE = Text(
-            template="<b>{user} Я</b>",
-            emojis={
-                "user": Emoji(
-                    fallback="👤",
-                    premium_id=None,
-                    comment="заголовок 'Я'",
-                ),
-            },
-            comment=".me — заголовок карточки. values: (нет)",
-        )
 
         PREMIUM_YES = Text(
             template="⭐ Premium: да",
@@ -406,17 +388,6 @@ class Texts:
     class Chat:
         """``.chat`` / ``.чат`` — инфо о текущем чате."""
 
-        TITLE = Text(
-            template="<b>{bubble} Чат</b>",
-            emojis={
-                "bubble": Emoji(
-                    fallback="💬",
-                    premium_id=None,
-                    comment="заголовок 'Чат'",
-                ),
-            },
-            comment=".chat — заголовок. values: (нет)",
-        )
 
     # ----------------------------------------------------------------
     # .who / .кто
@@ -424,17 +395,6 @@ class Texts:
     class Who:
         """``.who`` / ``.кто`` — карточка отправителя replied-сообщения."""
 
-        TITLE = Text(
-            template="<b>{lens} Кто это</b>",
-            emojis={
-                "lens": Emoji(
-                    fallback="🔍",
-                    premium_id=None,
-                    comment="заголовок 'Кто это'",
-                ),
-            },
-            comment=".who — заголовок. values: (нет)",
-        )
 
         NO_REPLY = Text(
             template="<blockquote>[x] Ответь этой командой на сообщение.</blockquote>",
@@ -498,10 +458,6 @@ class Texts:
             comment=".unwatch — не было. values: label",
         )
 
-        WATCHED_HEADER = Text(
-            template="<b>Отслеживаемые чаты:</b>",
-            comment=".watched — заголовок списка. values: (нет)",
-        )
 
         WATCHED_EMPTY = Text(
             template="[.] Нет отслеживаемых чатов.",
@@ -543,45 +499,12 @@ class Texts:
             comment=".hash — usage. values: algos",
         )
 
-        TITLE = Text(
-            template="<b>{lock} {algo}</b>",
-            emojis={
-                "lock": Emoji(
-                    fallback="🔐",
-                    premium_id=None,
-                    comment="заголовок 'алгоритм'",
-                ),
-            },
-            comment=".hash — заголовок. values: algo",
-        )
 
-        NO_TEXT = Text(
-            template="<blockquote>[x] Нет текста для хеширования.</blockquote>",
-            comment=".hash — нечего хешировать.",
-        )
 
-        DOWNLOAD_FAIL = Text(
-            template=(
-                "<blockquote>[x] Не удалось скачать <code>{hint}</code> "
-                "(слишком большой или недоступен).</blockquote>"
-            ),
-            comment=".hash — не удалось скачать reply-файл. values: hint",
-        )
 
     class Uuid:
         """``.uuid`` / ``.юид`` — UUIDv4 генератор."""
 
-        TITLE = Text(
-            template="<b>{tag} UUID4 ×{n}</b>",
-            emojis={
-                "tag": Emoji(
-                    fallback="🆔",
-                    premium_id=None,
-                    comment="заголовок 'UUID4 ×N'",
-                ),
-            },
-            comment=".uuid — заголовок. values: n",
-        )
 
     class B64:
         """``.b64`` / ``.base64`` — base64 encode/decode."""
@@ -597,22 +520,7 @@ class Texts:
             comment=".b64 — usage.",
         )
 
-        TITLE = Text(
-            template="<b>{lock} b64 {mode}</b>",
-            emojis={
-                "lock": Emoji(
-                    fallback="🔐",
-                    premium_id=None,
-                    comment="заголовок 'b64 MODE'",
-                ),
-            },
-            comment=".b64 — заголовок. values: mode (encode/decode/url-encode/url-decode)",
-        )
 
-        EMPTY = Text(
-            template="<blockquote>[x] Нечего кодировать.</blockquote>",
-            comment=".b64 — пустой ввод.",
-        )
 
     # ----------------------------------------------------------------
     # .tr / .calc / .save
@@ -655,13 +563,6 @@ class Texts:
     class Save:
         """``.save`` / ``.сохранить`` — в Избранное (нужна Telethon-сессия)."""
 
-        NEED_SESSION = Text(
-            template=(
-                "<blockquote>[x] <code>.save</code> требует Telethon-сессию.\n"
-                "Нажми /start → «Включить».</blockquote>"
-            ),
-            comment=".save — без сессии (в личке).",
-        )
 
         NEED_SESSION_PRIVATE = Text(
             template=(
@@ -670,10 +571,6 @@ class Texts:
             comment=".save — без сессии (в личке).",
         )
 
-        NEED_REPLY = Text(
-            template="<blockquote>[?] Ответь этой командой на сообщение, которое надо сохранить.</blockquote>",
-            comment=".save — без reply.",
-        )
 
         NEED_REPLY_SHORT = Text(
             template="<blockquote>[?] Ответь этой командой на сообщение.</blockquote>",
@@ -708,39 +605,11 @@ class Texts:
             comment=".timezone — заголовок списка. values: (нет)",
         )
 
-        CURRENT = Text(
-            template="Сейчас: <code>{cur}</code>",
-            comment=".timezone (без аргумента) — текущее значение. values: cur",
-        )
 
-        CURRENT_DEFAULT = Text(
-            template="Сейчас: <code>UTC</code> (по умолчанию)",
-            comment=".timezone (без аргумента) — TZ не задана.",
-        )
 
-        EXAMPLES = Text(
-            template="<b>Примеры:</b>",
-            comment=".timezone — подзаголовок 'Примеры'.",
-        )
 
-        EXAMPLE_LINES = (
-            "• <code>.timezone +3</code> — Москва, СПб",
-            "• <code>.timezone -5</code> — Нью-Йорк",
-            "• <code>.timezone +5:30</code> — Индия",
-            "• <code>.timezone Europe/Moscow</code> — по имени",
-            "• <code>.timezone МСК</code> / <code>.timezone киев</code> — алиас",
-            "• <code>.timezone UTC</code> / <code>.timezone reset</code> — сброс",
-        )
 
-        PRESETS_TITLE = Text(
-            template="<b>Пресеты:</b>",
-            comment=".timezone — подзаголовок 'Пресеты'.",
-        )
 
-        APPLY_HINT = Text(
-            template="[i] Применяется к <code>.time</code>.",
-            comment=".timezone — хинт в конце списка.",
-        )
 
         RESET_OK = Text(
             template="<blockquote>[OK] TZ: <code>UTC</code> (по умолчанию)</blockquote>",
@@ -779,48 +648,11 @@ class Texts:
     class Quote:
         """``.quote`` / ``.цитата`` — Telethon-only. Reply на сообщение."""
 
-        NEED_REPLY = Text(
-            template=(
-                "<blockquote>[?] Ответь этой командой на сообщение, "
-                "которое хочешь оформить как цитату.</blockquote>"
-            ),
-            comment=".quote — нет reply.",
-        )
 
-        NO_BODY = Text(
-            template=(
-                "<blockquote>[?] Сообщение без текста (медиа-only). "
-                "Цитировать нечего.</blockquote>"
-            ),
-            comment=".quote — reply без текста/caption.",
-        )
 
-        TITLE = Text(
-            template="<b>{speech} Цитата</b> · <i>{date}</i>",
-            emojis={
-                "speech": Emoji(
-                    fallback="💬",
-                    premium_id=None,
-                    comment="заголовок 'Цитата'",
-                ),
-            },
-            comment=".quote — заголовок. values: date",
-        )
 
-        FWD_LINE = Text(
-            template="\n<i>↪ переслано от: {fwd}</i>",
-            comment=".quote — forward-info строка. values: fwd (esc)",
-        )
 
-        FWD_LINE_ID = Text(
-            template="\n<i>↪ переслано от: <code>{fwd_id}</code></i>",
-            comment=".quote — forward-info по ID. values: fwd_id",
-        )
 
-        SIGNATURE = Text(
-            template="<i>— {sender_link}{chat_line}</i>",
-            comment=".quote — подпись внизу. values: sender_link, chat_line",
-        )
 
     # ----------------------------------------------------------------
     # .cmd справка / .cmd help
@@ -961,47 +793,10 @@ class Texts:
     class Ai:
         """``.ии`` / ``.ai`` — ИИ-ассистент. Только статические UI-строки."""
 
-        THINKING = Text(
-            template="[…] Думаю…",
-            comment=".ии — placeholder во время запроса к LLM.",
-        )
 
-        THINKING_ICON = Text(
-            template="{brain} Думаю…",
-            emojis={
-                "brain": Emoji(
-                    fallback="🧠",
-                    premium_id=None,
-                    comment="иконка перед 'Думаю…'",
-                ),
-            },
-            comment=".ии — thinking с эмодзи.",
-        )
 
-        TITLE = Text(
-            template="<b>{robot} ИИ</b>",
-            emojis={
-                "robot": Emoji(
-                    fallback="🤖",
-                    premium_id=None,
-                    comment="заголовок 'ИИ' в footer'е ответа",
-                ),
-            },
-            comment=".ии — заголовок финального ответа. values: (нет)",
-        )
 
-        RESET_ONE = Text(
-            template="[OK] История диалога сброшена (<code>{n}</code> сообщений).",
-            comment=".ии сброс — очистка одного чата. values: n",
-        )
 
-        RESET_ALL = Text(
-            template=(
-                "[OK] Сброшена история во всех чатах "
-                "(<code>{n}</code> диалогов)."
-            ),
-            comment=".ии сброс все — очистка всех чатов. values: n",
-        )
 
     # ----------------------------------------------------------------
     # .del / .tagall / .влс / .admins / .pin / .invitelink
@@ -1009,10 +804,6 @@ class Texts:
     class Delmsg:
         """``.del`` / ``.удалить`` — Telethon-only."""
 
-        USAGE = Text(
-            template="<blockquote>[x] Использование: <code>.del N</code></blockquote>",
-            comment=".del — usage.",
-        )
 
         NO_PERMS = Text(
             template="<blockquote>[x] Нет прав на удаление.</blockquote>",
@@ -1133,13 +924,6 @@ class Texts:
             comment=".ня в личке с ботом — нечего редактировать вне твоего аккаунта.",
         )
 
-        NEED_SESSION = Text(
-            template=(
-                "<blockquote>[x] <b>ня</b> требует Telethon-сессию.\n\n"
-                "Нажми /start → «Включить» для подключения.</blockquote>"
-            ),
-            comment=".ня — нет Telethon-сессии (aiogram-сценарий).",
-        )
 
         LIST_EMPTY = Text(
             template="<blockquote>[i] {paw} Нет активных чатов с режимом <b>ня</b>.</blockquote>",
@@ -1173,10 +957,6 @@ class Texts:
             comment=".admins — не группа.",
         )
 
-        NEED_ADMIN = Text(
-            template="<blockquote>[x] Нужны права администратора.</blockquote>",
-            comment=".admins — нет прав.",
-        )
 
         ERR = Text(
             template="<blockquote>[x] {etype}: {msg}</blockquote>",
@@ -1287,21 +1067,9 @@ class Texts:
         """Dot-команды Telethon-слоя. Каждая константа = один Text."""
 
         # Multi-target .who progress
-        WHO_PROGRESS = Text(
-            template="[…] Резолвлю {n} цель(ей)…",
-            comment="Telethon .who @a @b — progress. values: n",
-        )
 
         # Final summary for multi-target .who
-        WHO_SUMMARY_OK = Text(
-            template="[OK] {ok} resolved из {total}",
-            comment=".who multi — все ОК. values: ok, total",
-        )
 
-        WHO_SUMMARY_FAIL = Text(
-            template="[!] {ok} resolved, {fail} failed:\n{fails}",
-            comment=".who multi — есть failures. values: ok, fail, fails",
-        )
 
     # ----------------------------------------------------------------
     # Inline handlers
@@ -1309,10 +1077,6 @@ class Texts:
     class Inline:
         """Inline-кнопки и кнопки ``[Подключить бота]``."""
 
-        CONNECT_BTN = Text(
-            template="[+] Подключить бота",
-            comment="InlineQueryResultsButton (start_parameter='start').",
-        )
 
     # ----------------------------------------------------------------
     # Common / shared
@@ -1321,10 +1085,6 @@ class Texts:
         """Переиспользуемые куски."""
 
         # Кнопка /help + /status reply_markup hint
-        FOOTER_HINT = Text(
-            template="[i] Отключить сессию: <b>/logout</b>.",
-            comment="footer — хинт в нескольких ответах.",
-        )
 
 
 __all__ = ["Emoji", "Text", "Texts", "render_for_user", "render_for_entity", "render_plain"]

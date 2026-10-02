@@ -7,6 +7,8 @@ from html import escape as _h
 from aiogram import Router, types
 
 from ._base import command_card, dispatch, thread_kwargs
+from utils import rate_limit_gate as gate
+from utils.shared_cmd import b64_body, parse_b64_args
 from utils.escape import esc
 from utils.hashing import ALGOS, b64_op, hash_bytes, hash_text, gen_uuids
 from utils.linkcheck import check as check_link, extract_url
@@ -18,6 +20,18 @@ NET_CMDS = (".net", ".сеть", ".сет")
 HASH_CMDS = (".hash", ".хеш", ".хэш")
 UUID_CMDS = (".uuid", ".юид")
 B64_CMDS = (".b64", ".base64")
+
+RATE_LIMITED = gate.RATE_LIMIT_TEXT
+
+
+def _rate_limited(uid: str, head: str) -> bool:
+    """Лимит через единый гейт (см. utils/rate_limit_gate).
+
+    Один `.net` — это ~25 исходящих запросов (DNS к 4 резолверам, TLS-проба,
+    до 10 редиректов, unshorten на 15 хопов, crt.sh + до 30 имён). Раньше в
+    этом пути лимита не было вообще.
+    """
+    return gate.check(head, uid)
 
 
 def _head(text: str | None) -> str:
@@ -128,6 +142,9 @@ async def _do_net(uid: str, args: str, reply_text: str | None = None) -> str:
 async def cmd_net_private(message: types.Message):
     from utils.premium import resolve_effective_uid
     uid = await resolve_effective_uid(message)
+    if not _rate_limited(uid, ".net"):
+        await dispatch(message, command_card("Net", RATE_LIMITED))
+        return
     reply = message.reply_to_message.text if message.reply_to_message else None
     await dispatch(message, await _do_net(uid, _args(message.text), reply))
 
@@ -186,7 +203,11 @@ async def _do_hash(uid, args: str, message: types.Message) -> str:
 @router.message(lambda message: _is(HASH_CMDS, message.text))
 async def cmd_hash_private(message: types.Message):
     from utils.premium import resolve_effective_uid
-    await dispatch(message, await _do_hash(await resolve_effective_uid(message), _args(message.text), message))
+    uid = await resolve_effective_uid(message)
+    if not _rate_limited(uid, ".hash"):
+        await dispatch(message, command_card("Hash", RATE_LIMITED), card_title=None)
+        return
+    await dispatch(message, await _do_hash(uid, _args(message.text), message))
 
 
 async def _do_uuid(uid, args: str) -> str:
@@ -198,25 +219,37 @@ async def _do_uuid(uid, args: str) -> str:
 @router.message(lambda message: _is(UUID_CMDS, message.text))
 async def cmd_uuid_private(message: types.Message):
     from utils.premium import resolve_effective_uid
-    await dispatch(message, await _do_uuid(await resolve_effective_uid(message), _args(message.text)))
+    uid = await resolve_effective_uid(message)
+    if not _rate_limited(uid, ".uuid"):
+        await dispatch(message, command_card("UUID", RATE_LIMITED))
+        return
+    await dispatch(message, await _do_uuid(uid, _args(message.text)))
 
 
 async def _do_b64(uid, args: str, reply_text: str | None) -> str:
-    parts = args.split(maxsplit=1) if args else []
-    mode = parts[0].lower() if parts and parts[0].lower() in {"encode", "decode", "e", "d", "enc", "dec"} else "encode"
-    if mode in {"e", "enc"}: mode = "encode"
-    if mode in {"d", "dec"}: mode = "decode"
-    text = parts[1] if mode in {"encode", "decode"} and len(parts) > 1 else (args or reply_text or "")
-    if args and mode == "encode" and parts and parts[0].lower() in {"encode", "e", "enc"}:
-        text = parts[1] if len(parts) > 1 else ""
+    """Единая реализация `.b64` (utils/shared_cmd) для обоих путей.
+
+    Раньше здесь была вторая копия: без модификатора `url` и с другой
+    разметкой, чем в Telethon-пути, — одна команда вела себя по-разному
+    в зависимости от места вызова.
+    """
+    mode, text, url_safe = parse_b64_args(args)
+    if not text:
+        text = reply_text or ""
     if not text:
         return command_card("Base64", Texts.B64.HELP.render(premium=False))
-    result = b64_op(text, mode)
-    return command_card("Base64", f"<i>{mode}</i>\n<code>{esc(result)}</code>")
+    result = b64_op(text, mode, url_safe=url_safe)
+    if isinstance(result, str) and result.startswith("[x]"):
+        return command_card("Base64", esc(result))
+    return command_card("Base64", b64_body(mode, text, result, url_safe))
 
 
 @router.message(lambda message: _is(B64_CMDS, message.text))
 async def cmd_b64_private(message: types.Message):
     from utils.premium import resolve_effective_uid
+    uid = await resolve_effective_uid(message)
+    if not _rate_limited(uid, ".b64"):
+        await dispatch(message, command_card("Base64", RATE_LIMITED))
+        return
     reply = (message.reply_to_message.text or message.reply_to_message.caption) if message.reply_to_message else None
-    await dispatch(message, await _do_b64(await resolve_effective_uid(message), _args(message.text), reply))
+    await dispatch(message, await _do_b64(uid, _args(message.text), reply))

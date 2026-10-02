@@ -1,6 +1,6 @@
 from aiogram import Router, types
 
-from ._base import render_time, format_time, thread_kwargs
+from ._base import render_time, thread_kwargs
 
 router = Router()
 

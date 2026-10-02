@@ -19,6 +19,7 @@ utils/telethon_manager.py::_handle_outgoing.
 в TelethonManager._handle_outgoing ДО elif-chain для команд, и в TelethonManager._apply_nya
 (отдельный async-task) сами edit'ы через ``asyncio.wait_for(event.edit(...))``.
 """
+from utils.cmds import NYA_CMDS
 
 import asyncio
 from html import escape as _h
@@ -33,17 +34,10 @@ from utils.telethon_manager import telethon_manager
 from handlers.commands._base import command_card
 
 
-NYA_CMDS = (".ня",)
+
 NYA_OFF_ALIASES = ("стоп", "stop", "выкл", "off", "откл")
 NYA_LIST_ALIASES = ("список", "list", "все")
 
-
-def _check(t: str | None) -> bool:
-    """Возвращает True, если сообщение начинается с `.ня` (с пробелом или без)."""
-    if not t:
-        return False
-    head = t.strip().lower().split()[0]
-    return head in NYA_CMDS
 
 
 async def handle(user_id: str, event) -> None:

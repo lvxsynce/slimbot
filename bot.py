@@ -32,6 +32,35 @@ dp.include_router(session_router)
 dp.include_router(errors_router)
 
 
+def _start_modules() -> None:
+    """Поднять сохранённые модули всех юзеров.
+
+    Отдельная функция (а не тело `on_startup`), потому что сюда нельзя
+    `await`: модуль — обычный импорт Python, он не ждёт.
+    """
+    import logging as _logging
+
+    log = _logging.getLogger(__name__)
+    try:
+        from utils import modules as M
+        from utils import cmds
+        from utils import storage
+
+        if not M.modules_enabled():
+            log.info("modules: disabled via config")
+            return
+        M.set_system_heads(cmds.CMDS)
+        total = 0
+        for uid in sorted(storage.module_settings):
+            errors = M.load_user_modules(uid)
+            total += len(M.list_modules(uid))
+            for err in errors:
+                log.warning("modules: uid=%s %s", uid, err)
+        log.info("modules: %d loaded across %d users", total, len(storage.module_settings))
+    except Exception:
+        log.exception("modules: startup failed — бот продолжит без модулей")
+
+
 @dp.startup()
 async def on_startup():
     SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
@@ -40,6 +69,12 @@ async def on_startup():
     me = await bot.get_me()
     cfg.BOT_USERNAME = me.username
     print(f"@{me.username} ({BOT_NAME}) запущен...")
+
+    # Модули: сообщаем загрузчику системные команды (нужно для проверки
+    # конфликтов «свой .ping» vs системный) и поднимаем то, что юзеры
+    # ставили в прошлых сессиях. Ошибка одного модуля не должна мешать
+    # старту бота — поэтому всё под try/except.
+    _start_modules()
 
     from utils.telethon_manager import telethon_manager, auth_state_cleaner, cleanup_orphan_sessions
     cleanup_orphan_sessions()

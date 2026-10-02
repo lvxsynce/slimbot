@@ -1,11 +1,13 @@
 """Private-chat UI for selecting chats included in `.ии база`."""
 
+import asyncio
 import time
 
 from aiogram import F, Router, types
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
+from config import TELETHON_RESOLVE_TIMEOUT
 from utils.storage import get_knowledge_selected_chats, toggle_knowledge_chat
 from utils.telethon_manager import telethon_manager
 from ._base import command_card
@@ -48,7 +50,9 @@ async def _dialogs(user_id: str) -> list[dict]:
     client = telethon_manager.get_client(user_id)
     if not client:
         return []
-    me = await client.get_me()
+    # Под таймаутом: список чатов — сетевой вызов, а `.ии база` открывает
+    # инлайн-кнопки, и зависший RPC оставлял бы юзера с мёртвой кнопкой.
+    me = await asyncio.wait_for(client.get_me(), timeout=TELETHON_RESOLVE_TIMEOUT)
     own_id = int(me.id)
     result = []
     async for dialog in client.iter_dialogs(folder=None, ignore_migrated=False):

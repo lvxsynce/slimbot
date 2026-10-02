@@ -1,9 +1,8 @@
 from aiogram import Router, types
 
-from config import EXPENSIVE_COMMAND_LIMIT, EXPENSIVE_COMMAND_WINDOW
+from utils import rate_limit_gate as gate
 from utils.calc import calc as do_calc
 from utils.escape import esc
-from utils.rate_limit import allow
 from utils.storage import session_exists
 from utils.texts import Texts, render_for_user
 from ._base import command_card, thread_kwargs
@@ -171,6 +170,16 @@ async def _do_tr(uid: str, args: str, reply_text: str | None) -> str:
     return await _do_tr_ai(uid, lang, target)
 
 
+def _tr_limited(uid: str) -> bool:
+    """Лимит на `.tr` через единый гейт.
+
+    Каждый `.tr` — полноценный вызов Willow/GPT. Раньше лимита не было
+    ВООБЩЕ и не было гейта по сессии: любой, кто нашёл бота, мог жечь общий
+    LLM-ключ без ограничений.
+    """
+    return gate.check(".tr", uid)
+
+
 @router.message(lambda m: _tr_check(m.text))
 async def cmd_tr_private(message: types.Message):
     from utils.premium import resolve_effective_uid
@@ -180,6 +189,12 @@ async def cmd_tr_private(message: types.Message):
     reply_text = None
     if message.reply_to_message:
         reply_text = message.reply_to_message.text or message.reply_to_message.caption
+    if not _tr_limited(uid):
+        await message.reply(
+            command_card("Tr", "[x] Слишком много запросов. Подожди немного."),
+            **thread_kwargs(message),
+        )
+        return
     is_ai, _, _ = _parse_tr_args(args)
     if is_ai:
         sent = await message.reply(command_card("Tr", "[…] AI-перевод…"), **thread_kwargs(message))
@@ -204,7 +219,7 @@ async def _do_calc(uid, args: str) -> str:
 
 
 def _calc_limited(uid: str) -> bool:
-    return allow(uid, "network", limit=EXPENSIVE_COMMAND_LIMIT, window=EXPENSIVE_COMMAND_WINDOW)
+    return gate.check(".calc", uid)
 
 
 @router.message(lambda m: _calc_check(m.text))

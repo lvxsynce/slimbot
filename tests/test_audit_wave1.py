@@ -26,10 +26,13 @@ def test_text_render_keeps_literal_emoji_and_substitutes_placeholder():
     assert "{clock}" not in out
 
 
-def test_ping_template_renders_with_ms():
-    out = Texts.Ping.PING.render(premium=False, ms="12")
-    assert "12ms" in out
-    assert out.startswith("<b>Slim bot | Ping</b>")
+def test_ping_card_renders_with_ms():
+    """`.ping` переведён на общий форматтер (utils.shared_cmd)."""
+    from utils.shared_cmd import ping_body, ping_from_edits
+
+    body = ping_body(ping_from_edits(12))
+    assert "12 ms" in body
+    assert body.startswith("Telegram API RTT")
 
 
 def test_opencode_num_coerces_garbage():

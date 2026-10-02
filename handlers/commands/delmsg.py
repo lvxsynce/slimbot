@@ -1,20 +1,13 @@
 """Команда .del / .удалить — удалить N своих сообщений. Telethon-only."""
 
-import asyncio
+import logging
 
 from telethon.errors import FloodWaitError, MessageDeleteForbiddenError
 
 from utils.texts import Texts, render_for_user
 from handlers.commands._base import command_card
 
-DEL_CMDS = (".del", ".удалить")
-
-
-def _check(t: str | None) -> bool:
-    if not t:
-        return False
-    head = t.strip().lower().split()[0]
-    return head in DEL_CMDS
+logger = logging.getLogger(__name__)
 
 
 async def handle(user_id: str, event) -> None:
@@ -29,13 +22,16 @@ async def handle(user_id: str, event) -> None:
         if head.lstrip("+-").isdigit():
             n = max(1, min(int(head), 100))
 
-    # Команда сама (`event.id`) ВСЕГДА попадает в список удаления — `to_del = [event.id]`
-    # — и потом добирается через iter_messages для остальных N.
+    # Сначала собираем id-шники. Команда сама (`event.id`) ВСЕГДА в списке,
+    # остальные N добираются через iter_messages от автора команды.
+    #
+    # Падение delete_messages НЕ должно приводить к `event.edit(...)`:
+    # сообщение команды может уже быть удалено, и edit бросит
+    # MessageIdInvalidError. Пользователю в этом случае просто нечего
+    # показать — результат уже применён (или не применён) в чате.
     try:
-        msgs = []
         me = await event.client.get_me()
-        # Команда первая
-        msgs.append(event.id)
+        msgs = [event.id]
         async for m in event.client.iter_messages(
             event.chat_id,
             from_user=me.id,
@@ -48,21 +44,47 @@ async def handle(user_id: str, event) -> None:
                 break
         await event.client.delete_messages(event.chat_id, msgs)
     except MessageDeleteForbiddenError:
-        await event.edit(command_card("Del", Texts.Delmsg.NO_PERMS.render(premium=False)), parse_mode="html")
+        await _safe_edit(
+            event, command_card("Del", Texts.Delmsg.NO_PERMS.render(premium=False))
+        )
         return
     except FloodWaitError as e:
-        await event.edit(
-            command_card("Del", await render_for_user(user_id, Texts.Delmsg.FLOOD, seconds=str(e.seconds))),
-            parse_mode="html",
+        await _safe_edit(
+            event,
+            command_card(
+                "Del",
+                await render_for_user(user_id, Texts.Delmsg.FLOOD, seconds=str(e.seconds)),
+            ),
         )
         return
     except Exception as e:
-        await event.edit(
-            command_card("Del", await render_for_user(
-                user_id, Texts.Delmsg.ERR,
-                etype=type(e).__name__, msg=_h(str(e)),
-            )),
-            parse_mode="html",
+        await _safe_edit(
+            event,
+            command_card(
+                "Del",
+                await render_for_user(
+                    user_id, Texts.Delmsg.ERR,
+                    etype=type(e).__name__, msg=_h(str(e)),
+                ),
+            ),
         )
         return
-    await event.delete()
+
+    # Команда уже удалена вместе со списком выше. Раньше здесь стоял
+    # безусловный `await event.delete()` — второе удаление того же id
+    # кидало MessageIdInvalidError наружу, и outgoing_handler логировал
+    # необработанное исключение на КАЖДЫЙ `.del`.
+    return
+
+
+async def _safe_edit(event, text: str) -> None:
+    """edit, переживающий уже удалённое сообщение команды.
+
+    Если само сообщение уже удалено (или текст не изменился), edit бросит
+    MessageIdInvalidError / MessageNotModifiedError. Это не ошибка команды —
+    молча проглатываем.
+    """
+    try:
+        await event.edit(text, parse_mode="html")
+    except Exception:
+        logger.debug("delmsg: edit after delete failed", exc_info=True)

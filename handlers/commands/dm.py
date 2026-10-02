@@ -1,17 +1,12 @@
 """Команда .влс / .лс / .dm — отправить текст автору replied в ЛС. Telethon-only."""
+from utils.cmds import DM_CMDS
 
 from utils.texts import Texts, render_for_user
 from utils.telethon_manager import telethon_reply_to
 from handlers.commands._base import command_card
 
-DM_CMDS = (".влс", ".vls", ".лс", ".dm")
 
 
-def _check(t: str | None) -> bool:
-    if not t:
-        return False
-    head = t.strip().lower().split()[0]
-    return head in DM_CMDS
 
 
 async def handle(user_id: str, event) -> None:

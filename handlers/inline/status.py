@@ -16,14 +16,16 @@ from aiogram.types import (
 )
 
 from utils.bot_info import bot_username_at
-from utils.storage import user_sessions
+from utils.inline_kb import connect_button
+from utils.storage import session_exists, user_sessions
 from utils.telethon_manager import telethon_manager
 
-from . import connect_button, uptime_seconds
+from config import INLINE_CACHE_STATUS, INLINE_CACHE_LOCKED
+
+from . import uptime_seconds
 
 
 STATUS_KEYWORDS = ("статус", "status")
-CACHE_TIME = 15
 
 
 def is_status_query(q: str) -> bool:
@@ -81,7 +83,6 @@ async def _build_status_text(bot: Bot) -> str:
 
 async def handle(inline: InlineQuery, bot: Bot) -> None:
     """Обрабатывает inline-запрос @bot статус."""
-    from utils.storage import session_exists
     uid = str(inline.from_user.id)
     bot_at = bot_username_at()
 
@@ -105,7 +106,7 @@ async def handle(inline: InlineQuery, bot: Bot) -> None:
                     ),
                 ),
             ],
-            cache_time=10,
+            cache_time=INLINE_CACHE_LOCKED,
             is_personal=True,
             button=connect_button(),
         )
@@ -124,6 +125,6 @@ async def handle(inline: InlineQuery, bot: Bot) -> None:
                 ),
             ),
         ],
-        cache_time=CACHE_TIME,
+        cache_time=INLINE_CACHE_STATUS,
         is_personal=True,
     )
