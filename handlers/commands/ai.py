@@ -1444,7 +1444,6 @@ async def _handle_locked(user_id: str, event, raw: str, chat_id: int, thread_id:
     if not effective_query and not reply:
         hsize = ai_memory.size(user_id, chat_id, thread_id)
         from utils.shared_cmd import ai_usage_hint
-        from config import AI_CONTEXT_LEN_DEFAULT
         await event.edit(
             "[?] Использование:\n" + ai_usage_hint(
                 has_session=True, ctx_default=AI_CONTEXT_LEN_DEFAULT,

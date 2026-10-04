@@ -401,7 +401,7 @@ handlers/
     __init__.py         # dispatch_inline — единственный inline_query
     help.py  status.py  profile.py
 
-tests/                  # 926 тестов
+tests/                  # 931 тест
 ```
 
 ---
@@ -435,3 +435,7 @@ tests/                  # 926 тестов
 17. Ни один хендлер на `handlers.commands` не ловит событие «на
     автомате»: хендлер, вернувший не-`UNHANDLED`, останавливает
     обход всей цепочки. Ранние выходы — только `SkipHandler`.
+18. Модульный `import` не затеняет одноимённый импорт уровня модуля.
+    `from config import X` внутри функции делает `X` локальным для
+    **всей** функции: обращение выше по тексту даёт `UnboundLocalError`.
+    Именно этим падал `.ии` (ловит `tests/test_shadowed_imports.py`).

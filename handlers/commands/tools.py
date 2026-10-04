@@ -136,10 +136,8 @@ async def _do_tr_ai(uid: str, lang: str, target: str) -> str:
         system_override=TR_AI_SYSTEM,
     )
     if err:
-        from utils.escape import esc
         return command_card("Tr", f"[x] AI-перевод: {esc(err)}")
 
-    from utils.escape import esc
     text = esc(answer.strip())
     if not text:
         return command_card("Tr", "[x] AI вернул пустой ответ.")
